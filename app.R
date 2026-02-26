@@ -227,8 +227,8 @@ build_network <- function(tables, rels, pk_map) {
           "font-family:IBM Plex Mono,monospace;",
           "font-size:12px;",
           "padding:14px 16px;",
-          "min-width:220px;",
-          "max-width:320px;",
+          "min-width:260px;",
+          "max-width:420px;",
           "border:1px solid #1e3a5f;",
           "border-radius:8px;",
           "line-height:1.7;",
@@ -258,10 +258,34 @@ build_network <- function(tables, rels, pk_map) {
           "</span>",
           "</div>",
           "<div style='border-top:1px solid #1e3a5f;padding-top:8px;'>",
-          "<span style='color:#64748b;font-size:10px;letter-spacing:1px;'>COLUMNS</span><br>",
-          "<span style='color:#94a3b8;font-size:11px;'>",
-          paste(names(df), collapse = ", "),
-          "</span>",
+          "<span style='color:#64748b;font-size:10px;letter-spacing:1px;'>COLUMNS</span>",
+          "<div style='display:flex;flex-wrap:wrap;gap:3px;margin-top:6px;'>",
+          paste(
+            vapply(
+              names(df),
+              function(cn) {
+                chip_bg <- if (cn %in% pks) {
+                  "background:#2a1a00;color:#fbbf24;border-color:#78350f;"
+                } else if (
+                  cn %in% vapply(fkr, `[[`, character(1), "from_col")
+                ) {
+                  "background:#1a0a2e;color:#c084fc;border-color:#4c1d95;"
+                } else {
+                  "background:rgba(255,255,255,0.04);color:#94a3b8;border-color:#1e3a5f;"
+                }
+                paste0(
+                  "<span style='",
+                  chip_bg,
+                  "border:1px solid;border-radius:4px;padding:1px 6px;font-size:10px;white-space:nowrap;'>",
+                  cn,
+                  "</span>"
+                )
+              },
+              character(1)
+            ),
+            collapse = ""
+          ),
+          "</div>",
           "</div>",
           "</div>"
         )
@@ -654,6 +678,31 @@ ui <- fluidPage(
       vertical-align: middle;
     }
     .cache-badge.fresh { color: #4ade80; border-color: #14532d; background: #0c2a1a; }
+
+    /* ── Sticky node panel internals ─────────────────────────── */
+    #node-panel-overlay .panel-section {
+      padding: 12px 16px; border-bottom: 1px solid #1e3a5f;
+    }
+    #node-panel-overlay .panel-section:last-child { border-bottom: none; }
+    #node-panel-overlay .panel-label {
+      font-size: 10px; letter-spacing: 1px; color: #64748b;
+      text-transform: uppercase; margin-bottom: 6px;
+    }
+    #node-panel-overlay .col-chip {
+      display: inline-block; margin: 2px; padding: 2px 7px;
+      border-radius: 4px; font-size: 11px; border: 1px solid;
+    }
+    body.light-mode #node-panel-overlay { background: #ffffff !important; border-color: #cbd5e1 !important; }
+    body.light-mode #node-panel-overlay .panel-section { border-color: #e2e8f0 !important; }
+    body.light-mode #node-panel-overlay .panel-label { color: #94a3b8; }
+
+    /* ── Name Changes tab ─────────────────────────────────────── */
+    .rename-summary {
+      font-size: 12px; color: var(--text-faint); font-family: "IBM Plex Mono", monospace;
+      margin-bottom: 12px; padding: 8px 12px;
+      background: var(--bg-inset); border: 1px solid var(--border); border-radius: 6px;
+    }
+    .rename-summary b { color: var(--accent); }
   '
     )),
     tags$script(HTML(
@@ -674,7 +723,35 @@ ui <- fluidPage(
             Shiny.setInputValue("remove_table_name", e.target.dataset.tname, {priority: "event"});
           }
         });
+        // Sticky node panel close button
+        document.body.addEventListener("click", function(e) {
+          if (e.target.id === "node-panel-close") {
+            document.getElementById("node-panel-overlay").style.display = "none";
+            Shiny.setInputValue("vis_close_panel", Math.random(), {priority: "event"});
+          }
+        });
+        // Light mode: flip node panel to light
+        var observer = new MutationObserver(function() {
+          var panel = document.getElementById("node-panel-overlay");
+          if (!panel) return;
+          if (document.body.classList.contains("light-mode")) {
+            panel.style.background = "#ffffff";
+            panel.style.borderColor = "#cbd5e1";
+            panel.style.color = "#0f172a";
+          } else {
+            panel.style.background = "#0f172a";
+            panel.style.borderColor = "#1e3a5f";
+            panel.style.color = "#e2e8f0";
+          }
+        });
+        observer.observe(document.body, {attributes: true, attributeFilter: ["class"]});
       });
+      // Called by visNetwork click event via Shiny.setInputValue
+      function showNodePanel(nodeId) {
+        if (!nodeId) return;
+        var panel = document.getElementById("node-panel-overlay");
+        if (panel) panel.style.display = "block";
+      }
     '
     ))
   ),
@@ -825,9 +902,38 @@ ui <- fluidPage(
           uiOutput("relationships_ui"),
           br(),
           downloadButton("dl_rels", "⬇  Export CSV", class = "dl-btn")
-        )
+        ),
+
+        # --- Name Changes ---
+        tabPanel("Name Changes", br(), uiOutput("rename_log_ui"))
       )
     )
+  ),
+
+  # ---- Sticky node detail panel (overlay) ----
+  tags$div(
+    id = "node-panel-overlay",
+    style = paste0(
+      "display:none;position:fixed;top:80px;right:20px;z-index:9999;",
+      "width:360px;max-height:80vh;overflow-y:auto;",
+      "background:#0f172a;border:1px solid #1e3a5f;border-radius:10px;",
+      "box-shadow:0 8px 32px rgba(0,0,0,0.7);",
+      "font-family:'IBM Plex Mono',monospace;"
+    ),
+    tags$div(
+      style = "display:flex;justify-content:space-between;align-items:center;padding:12px 16px 8px;border-bottom:1px solid #1e3a5f;",
+      tags$span(
+        id = "node-panel-title",
+        style = "color:#60a5fa;font-size:13px;font-weight:700;",
+        "Table Details"
+      ),
+      tags$button(
+        id = "node-panel-close",
+        style = "background:none;border:none;color:#64748b;font-size:18px;cursor:pointer;padding:0;line-height:1;",
+        "\u00d7"
+      )
+    ),
+    uiOutput("node_panel_ui")
   ),
   br()
 )
@@ -841,6 +947,14 @@ server <- function(input, output, session) {
   # State: accumulated tables (name -> data.frame)
   # ============================================================
   all_tables_rv <- reactiveVal(list())
+  rename_log_rv <- reactiveVal(data.frame(
+    object_type = character(),
+    source = character(),
+    original_name = character(),
+    cleaned_name = character(),
+    stringsAsFactors = FALSE
+  ))
+  selected_node_rv <- reactiveVal(NULL)
 
   # ---- Add files when fileInput fires ----
   observeEvent(input$csv_files, {
@@ -849,17 +963,20 @@ server <- function(input, output, session) {
     n_files <- nrow(input$csv_files)
 
     # Read all files, showing a progress bar
-    new_tbls <- withProgress(message = "Reading CSV files...", value = 0, {
+    # For each file: read raw first to capture original names, then clean
+    raw_and_clean <- withProgress(message = "Reading CSV files...", value = 0, {
       lapply(seq_len(n_files), function(i) {
         incProgress(1 / n_files, detail = input$csv_files$name[i])
         tryCatch(
-          janitor::clean_names(
-            read.csv(
+          {
+            raw_df <- read.csv(
               input$csv_files$datapath[i],
               stringsAsFactors = FALSE,
               check.names = FALSE
             )
-          ),
+            clean_df <- janitor::clean_names(raw_df)
+            list(raw = raw_df, clean = clean_df, ok = TRUE)
+          },
           error = function(e) {
             message(
               "Read error on ",
@@ -867,12 +984,13 @@ server <- function(input, output, session) {
               ": ",
               conditionMessage(e)
             )
-            NULL
+            list(ok = FALSE)
           }
         )
       })
     })
 
+    new_tbls <- lapply(raw_and_clean, function(x) if (x$ok) x$clean else NULL)
     valid <- !vapply(new_tbls, is.null, logical(1))
     new_tbls <- new_tbls[valid]
     new_names <- tools::file_path_sans_ext(input$csv_files$name[valid])
@@ -903,6 +1021,40 @@ server <- function(input, output, session) {
     }
     all_tables_rv(merged)
 
+    # Build rename log for changed names in this batch
+    valid_rc <- raw_and_clean[valid]
+    new_rows <- do.call(
+      rbind,
+      lapply(seq_along(valid_rc), function(i) {
+        rc <- valid_rc[[i]]
+        tname <- new_names[i]
+        orig_cols <- names(rc$raw)
+        clean_cols <- names(rc$clean)
+        changed <- orig_cols != clean_cols
+        if (!any(changed)) {
+          return(NULL)
+        }
+        data.frame(
+          object_type = "column",
+          source = tname,
+          original_name = orig_cols[changed],
+          cleaned_name = clean_cols[changed],
+          stringsAsFactors = FALSE
+        )
+      })
+    )
+
+    if (!is.null(new_rows) && nrow(new_rows) > 0) {
+      existing_log <- rename_log_rv()
+      # Drop old entries for tables being replaced, then append
+      existing_log <- existing_log[
+        !existing_log$source %in% new_names,
+        ,
+        drop = FALSE
+      ]
+      rename_log_rv(rbind(existing_log, new_rows))
+    }
+
     n_replaced <- sum(new_names %in% names(existing))
     n_added <- length(new_tbls) - n_replaced
     parts <- character(0)
@@ -930,12 +1082,21 @@ server <- function(input, output, session) {
     tbl <- all_tables_rv()
     tbl[[nm]] <- NULL
     all_tables_rv(tbl)
+    log <- rename_log_rv()
+    rename_log_rv(log[log$source != nm, , drop = FALSE])
     showNotification(paste0("Removed: ", nm), type = "message", duration = 3)
   })
 
   # ---- Clear all tables ----
   observeEvent(input$btn_clear_tables, {
     all_tables_rv(list())
+    rename_log_rv(data.frame(
+      object_type = character(),
+      source = character(),
+      original_name = character(),
+      cleaned_name = character(),
+      stringsAsFactors = FALSE
+    ))
     fk_cache$key <- NULL
     fk_cache$result <- list()
     showNotification("All tables cleared.", type = "message", duration = 3)
@@ -1145,6 +1306,17 @@ server <- function(input, output, session) {
             navigationButtons = TRUE,
             tooltipDelay = 80,
             hover = TRUE
+          ) %>%
+          visEvents(
+            click = "function(params) {
+          if (params.nodes.length > 0) {
+            Shiny.setInputValue('vis_clicked_node', {
+              id: params.nodes[0],
+              ts: Date.now()
+            }, {priority: 'event'});
+            showNodePanel(params.nodes[0]);
+          }
+        }"
           )
       },
       error = function(e) {
@@ -1343,6 +1515,163 @@ server <- function(input, output, session) {
       })
     )
   })
+
+  # ---- Sticky node detail panel ----
+  observeEvent(input$vis_clicked_node, {
+    req(input$vis_clicked_node$id)
+    selected_node_rv(input$vis_clicked_node$id)
+  })
+
+  output$node_panel_ui <- renderUI({
+    node_id <- selected_node_rv()
+    req(node_id)
+    tbls <- all_tables_rv()
+    pks <- pk_map_rv()
+    rels <- all_rels_rv()
+
+    # node_id is the integer index; map back to table name
+    tnames <- names(tbls)
+    req(node_id <= length(tnames))
+    t <- tnames[[node_id]]
+    df <- tbls[[t]]
+    pk_v <- pks[[t]]
+    fk_r <- Filter(function(r) r$from_table == t, rels)
+    fk_cols <- vapply(fk_r, `[[`, character(1), "from_col")
+
+    # Column chips: PK = amber, FK = purple, plain = muted
+    col_chips <- lapply(names(df), function(cn) {
+      if (cn %in% pk_v) {
+        tags$span(
+          class = "col-chip",
+          style = "background:#2a1a00;color:#fbbf24;border-color:#78350f;",
+          cn
+        )
+      } else if (cn %in% fk_cols) {
+        tags$span(
+          class = "col-chip",
+          style = "background:#1a0a2e;color:#c084fc;border-color:#4c1d95;",
+          cn
+        )
+      } else {
+        tags$span(
+          class = "col-chip",
+          style = "background:rgba(255,255,255,0.04);color:#94a3b8;border-color:#1e3a5f;",
+          cn
+        )
+      }
+    })
+
+    tagList(
+      # Stats
+      tags$div(
+        class = "panel-section",
+        tags$div(class = "panel-label", "Overview"),
+        tags$div(
+          style = "display:flex;gap:12px;flex-wrap:wrap;",
+          tags$span(
+            class = "pill pill-rows",
+            paste0(format(nrow(df), big.mark = ","), " rows")
+          ),
+          tags$span(class = "pill pill-cols", paste0(ncol(df), " cols"))
+        )
+      ),
+      # PKs
+      tags$div(
+        class = "panel-section",
+        tags$div(class = "panel-label", "Primary Key(s)"),
+        if (length(pk_v) > 0) {
+          tags$div(lapply(pk_v, function(p) {
+            tags$span(class = "pill pill-pk", p)
+          }))
+        } else {
+          tags$span(style = "color:#f87171;font-size:12px;", "none detected")
+        }
+      ),
+      # FKs
+      tags$div(
+        class = "panel-section",
+        tags$div(class = "panel-label", "Foreign Key(s)"),
+        if (length(fk_r) > 0) {
+          tags$div(lapply(fk_r, function(r) {
+            to_col <- if (!is.na(r$to_col) && !is.null(r$to_col)) {
+              r$to_col
+            } else {
+              "?"
+            }
+            tags$div(
+              style = "font-size:11px;color:#c084fc;padding:1px 0;",
+              paste0(r$from_col, " → ", r$to_table, ".", to_col)
+            )
+          }))
+        } else {
+          tags$span(style = "color:#64748b;font-size:12px;", "none")
+        }
+      ),
+      # All columns
+      tags$div(
+        class = "panel-section",
+        tags$div(class = "panel-label", paste0("Columns (", ncol(df), ")")),
+        tags$div(style = "display:flex;flex-wrap:wrap;gap:3px;", col_chips)
+      )
+    )
+  })
+
+  # ---- Name Changes tab ----
+  output$rename_log_ui <- renderUI({
+    log <- rename_log_rv()
+    if (nrow(log) == 0) {
+      return(tagList(
+        div(
+          class = "rename-summary",
+          "No name changes detected. All column names were already clean."
+        ),
+        div(
+          class = "empty-state",
+          div(style = "font-size:36px;margin-bottom:12px;", "✓"),
+          h4("All names clean"),
+          p(
+            style = "font-size:13px;color:var(--text-faint);",
+            "janitor::clean_names() found nothing to rename in the uploaded files."
+          )
+        )
+      ))
+    }
+
+    n_tables <- length(unique(log$source))
+    tagList(
+      div(
+        class = "rename-summary",
+        tags$b(nrow(log)),
+        " column name(s) renamed across ",
+        tags$b(n_tables),
+        " table(s). ",
+        "Amber = PK-related, purple = FK-related columns."
+      ),
+      DTOutput("dt_rename_log"),
+      br(),
+      downloadButton("dl_rename_log", "\u2b07  Export CSV", class = "dl-btn")
+    )
+  })
+
+  output$dt_rename_log <- renderDT(
+    {
+      log <- rename_log_rv()
+      req(nrow(log) > 0)
+      datatable(
+        log,
+        colnames = c("Type", "Table", "Original Name", "Cleaned Name"),
+        options = list(pageLength = 20, dom = "ftp", scrollX = TRUE),
+        rownames = FALSE,
+        selection = "none"
+      )
+    },
+    server = FALSE
+  )
+
+  output$dl_rename_log <- downloadHandler(
+    filename = "name_changes.csv",
+    content = function(file) write.csv(rename_log_rv(), file, row.names = FALSE)
+  )
 
   # ---- Download ----
   output$dl_rels <- downloadHandler(
