@@ -17,6 +17,193 @@ library(janitor)
 # lowercase, non-alphanumeric -> "_", collapse/trim underscores.
 clean_name <- function(name) janitor::make_clean_names(name)
 
+# ---- Access database reader ----------------------------------------
+# Strategy 1 (all platforms): RJDBC + UCanAccess pure-Java JDBC driver.
+#   Requires: install.packages("RJDBC") and Java (usually pre-installed).
+#   JARs are downloaded once to a local cache folder on first use.
+# Strategy 2 (Windows fallback): RODBC.
+#   Requires: install.packages("RODBC") + Microsoft Access Database Engine.
+# Returns a named list of data.frames, one per user table.
+# Errors are passed to notify_fn(msg) rather than thrown.
+
+# Default JAR cache location (alongside app.R, or in user cache dir)
+access_jar_dir <- function() {
+  app_jars <- file.path(dirname(sys.frame(1)$ofile %||% "."), "access_jars")
+  if (dir.exists(app_jars) || dir.create(app_jars, showWarnings = FALSE)) {
+    return(app_jars)
+  }
+  tools::R_user_dir("table_explorer_access_jars", "cache")
+}
+
+`%||%` <- function(a, b) if (!is.null(a) && length(a) > 0 && nzchar(a)) a else b
+
+# UCanAccess JARs from Maven Central (stable long-lived URLs)
+ucanaccess_jars <- list(
+  list(
+    file = "ucanaccess-5.0.1.jar",
+    url = "https://repo1.maven.org/maven2/net/sf/ucanaccess/ucanaccess/5.0.1/ucanaccess-5.0.1.jar"
+  ),
+  list(
+    file = "jackcess-4.0.1.jar",
+    url = "https://repo1.maven.org/maven2/com/healthmarketscience/jackcess/jackcess/4.0.1/jackcess-4.0.1.jar"
+  ),
+  list(
+    file = "commons-lang3-3.12.0.jar",
+    url = "https://repo1.maven.org/maven2/org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar"
+  ),
+  list(
+    file = "commons-logging-1.2.jar",
+    url = "https://repo1.maven.org/maven2/commons-logging/commons-logging/1.2/commons-logging-1.2.jar"
+  ),
+  list(
+    file = "hsqldb-2.7.1.jar",
+    url = "https://repo1.maven.org/maven2/org/hsqldb/hsqldb/2.7.1/hsqldb-2.7.1.jar"
+  )
+)
+
+ensure_ucanaccess_jars <- function(jar_dir, notify_fn) {
+  if (!dir.exists(jar_dir)) {
+    dir.create(jar_dir, recursive = TRUE, showWarnings = FALSE)
+  }
+  for (j in ucanaccess_jars) {
+    dest <- file.path(jar_dir, j$file)
+    if (!file.exists(dest)) {
+      notify_fn(paste0("Downloading ", j$file, "..."))
+      tryCatch(
+        utils::download.file(j$url, dest, mode = "wb", quiet = TRUE),
+        error = function(e) {
+          notify_fn(paste0(
+            "Failed to download ",
+            j$file,
+            ": ",
+            conditionMessage(e)
+          ))
+        }
+      )
+    }
+  }
+  jar_paths <- file.path(
+    jar_dir,
+    vapply(ucanaccess_jars, `[[`, character(1), "file")
+  )
+  all(file.exists(jar_paths))
+}
+
+read_access_db <- function(path, notify_fn = message) {
+  # ── Strategy 1: RJDBC + UCanAccess (all platforms, needs Java) ──
+  if (requireNamespace("RJDBC", quietly = TRUE)) {
+    jar_dir <- tryCatch(
+      file.path(dirname(normalizePath(path, mustWork = FALSE)), "access_jars"),
+      error = function(e) tools::R_user_dir("table_explorer", "cache")
+    )
+    jars_ok <- tryCatch(
+      ensure_ucanaccess_jars(jar_dir, notify_fn),
+      error = function(e) FALSE
+    )
+
+    if (jars_ok) {
+      jar_paths <- file.path(
+        jar_dir,
+        vapply(ucanaccess_jars, `[[`, character(1), "file")
+      )
+      result <- tryCatch(
+        {
+          drv <- RJDBC::JDBC(
+            driverClass = "net.ucanaccess.jdbc.UcanaccessDriver",
+            classPath = jar_paths
+          )
+          jdbc_url <- paste0(
+            "jdbc:ucanaccess://",
+            normalizePath(path, winslash = "/")
+          )
+          con <- DBI::dbConnect(drv, jdbc_url)
+          on.exit(
+            tryCatch(DBI::dbDisconnect(con), error = function(e) NULL),
+            add = TRUE
+          )
+
+          # List user tables only (skip system tables starting with "MSys")
+          all_tables <- DBI::dbListTables(con)
+          user_tables <- all_tables[!grepl("^MSys|^USys|^~", all_tables)]
+
+          tbls <- setNames(
+            lapply(user_tables, function(tname) {
+              tryCatch(
+                DBI::dbReadTable(con, tname),
+                error = function(e) {
+                  notify_fn(paste0(
+                    "Could not read table '",
+                    tname,
+                    "': ",
+                    conditionMessage(e)
+                  ))
+                  NULL
+                }
+              )
+            }),
+            user_tables
+          )
+          Filter(Negate(is.null), tbls)
+        },
+        error = function(e) {
+          notify_fn(paste0(
+            "RJDBC/UCanAccess error: ",
+            conditionMessage(e),
+            " — is Java installed? Run `Sys.getenv('JAVA_HOME')` to check."
+          ))
+          NULL
+        }
+      )
+      if (!is.null(result) && length(result) > 0) return(result)
+    }
+  }
+
+  # ── Strategy 2: RODBC (Windows — needs Access Database Engine) ───
+  if (
+    requireNamespace("RODBC", quietly = TRUE) && .Platform$OS.type == "windows"
+  ) {
+    result <- tryCatch(
+      {
+        con <- RODBC::odbcConnectAccess2007(path)
+        if (inherits(con, "RODBC")) {
+          on.exit(RODBC::odbcClose(con), add = TRUE)
+          tnames <- RODBC::sqlTables(con, tableType = "TABLE")$TABLE_NAME
+          tbls <- setNames(
+            lapply(tnames, function(tname) {
+              tryCatch(
+                RODBC::sqlFetch(con, tname, stringsAsFactors = FALSE),
+                error = function(e) {
+                  notify_fn(paste0(
+                    "RODBC: could not fetch '",
+                    tname,
+                    "': ",
+                    conditionMessage(e)
+                  ))
+                  NULL
+                }
+              )
+            }),
+            tnames
+          )
+          Filter(Negate(is.null), tbls)
+        } else {
+          NULL
+        }
+      },
+      error = function(e) NULL
+    )
+    if (!is.null(result) && length(result) > 0) return(result)
+  }
+
+  # ── No strategy succeeded ────────────────────────────────────────
+  notify_fn(paste0(
+    "Could not read Access file. ",
+    "Install the RJDBC package (install.packages('RJDBC')) and ensure Java is available. ",
+    "The required UCanAccess JARs will be downloaded automatically on first use. ",
+    "On Windows, RODBC + the Microsoft Access Database Engine are also accepted."
+  ))
+  list()
+}
 
 # Extract the stem from an _id column: "document_id" -> "document"
 id_stem <- function(col_clean) sub("_id$", "", col_clean)
@@ -791,6 +978,21 @@ ui <- fluidPage(
           placeholder = "No files selected",
           buttonLabel = "Add CSV(s)"
         ),
+        fileInput(
+          "mdb_file",
+          NULL,
+          multiple = FALSE,
+          accept = c(".mdb", ".accdb"),
+          placeholder = "No file selected",
+          buttonLabel = "Add Access DB"
+        ),
+        div(
+          style = "font-size:10px;color:var(--text-faint);margin-top:-8px;margin-bottom:4px;line-height:1.5;",
+          "Needs ",
+          tags$code("RJDBC"),
+          " package + Java.",
+          " JARs auto-download on first use."
+        ),
         uiOutput("loaded_tables_ui"),
         actionButton(
           "btn_clear_tables",
@@ -955,15 +1157,19 @@ server <- function(input, output, session) {
     stringsAsFactors = FALSE
   ))
   selected_node_rv <- reactiveVal(NULL)
+  # metadata store: name -> list(size, mtime, nrow, ncol)
+  table_meta_rv <- reactiveVal(list())
+  # pending conflict queue: list of conflict descriptor lists
+  pending_conflicts_rv <- reactiveVal(list())
 
   # ---- Add files when fileInput fires ----
   observeEvent(input$csv_files, {
     req(input$csv_files)
     existing <- all_tables_rv()
+    existing_meta <- table_meta_rv()
     n_files <- nrow(input$csv_files)
 
-    # Read all files, showing a progress bar
-    # For each file: read raw first to capture original names, then clean
+    # Read all files (raw + clean) with a progress bar
     raw_and_clean <- withProgress(message = "Reading CSV files...", value = 0, {
       lapply(seq_len(n_files), function(i) {
         incProgress(1 / n_files, detail = input$csv_files$name[i])
@@ -975,7 +1181,18 @@ server <- function(input, output, session) {
               check.names = FALSE
             )
             clean_df <- janitor::clean_names(raw_df)
-            list(raw = raw_df, clean = clean_df, ok = TRUE)
+            finfo <- file.info(input$csv_files$datapath[i])
+            list(
+              ok = TRUE,
+              raw = raw_df,
+              clean = clean_df,
+              meta = list(
+                size = input$csv_files$size[i],
+                mtime = finfo$mtime,
+                nrow = nrow(clean_df),
+                ncol = ncol(clean_df)
+              )
+            )
           },
           error = function(e) {
             message(
@@ -990,13 +1207,11 @@ server <- function(input, output, session) {
       })
     })
 
-    new_tbls <- lapply(raw_and_clean, function(x) if (x$ok) x$clean else NULL)
-    valid <- !vapply(new_tbls, is.null, logical(1))
-    new_tbls <- new_tbls[valid]
+    valid <- vapply(raw_and_clean, `[[`, logical(1), "ok")
+    valid_rc <- raw_and_clean[valid]
     new_names <- tools::file_path_sans_ext(input$csv_files$name[valid])
     failed <- input$csv_files$name[!valid]
 
-    # Surface any per-file failures
     for (fn in failed) {
       showNotification(
         paste0("Could not read: ", fn),
@@ -1004,8 +1219,7 @@ server <- function(input, output, session) {
         duration = 8
       )
     }
-
-    if (length(new_tbls) == 0) {
+    if (length(valid_rc) == 0) {
       showNotification(
         "No valid CSV files could be loaded.",
         type = "error",
@@ -1014,74 +1228,419 @@ server <- function(input, output, session) {
       return()
     }
 
-    # Merge: new tables overwrite on name clash, otherwise append
+    # ── Classify each incoming file ──────────────────────────────────
+    new_files <- list() # name -> rc (no clash — just add)
+    exact_dupes <- character(0) # names that are exact duplicates
+    conflicts <- list() # list of conflict descriptors for the modal
+
+    for (i in seq_along(valid_rc)) {
+      nm <- new_names[i]
+      rc <- valid_rc[[i]]
+      inc <- rc$meta # incoming metadata
+
+      if (!nm %in% names(existing)) {
+        # No clash at all — straightforward add
+        new_files[[nm]] <- rc
+      } else {
+        # Name clash — compare metadata
+        ex <- existing_meta[[nm]]
+        same_size <- !is.null(ex) &&
+          identical(as.numeric(inc$size), as.numeric(ex$size))
+        same_dims <- !is.null(ex) &&
+          identical(inc$nrow, ex$nrow) &&
+          identical(inc$ncol, ex$ncol)
+
+        if (same_size && same_dims) {
+          # Almost certainly the same file
+          exact_dupes <- c(exact_dupes, nm)
+        } else {
+          # Different content — queue for user resolution
+          conflicts[[length(conflicts) + 1]] <- list(
+            name = nm,
+            rc = rc,
+            existing_meta = ex,
+            incoming_meta = inc
+          )
+        }
+      }
+    }
+
+    # Warn about exact duplicates
+    for (nm in exact_dupes) {
+      showNotification(
+        paste0(
+          "\u26a0 '",
+          nm,
+          "': identical file already loaded — no changes made."
+        ),
+        type = "warning",
+        duration = 6
+      )
+    }
+
+    # Apply the non-conflicting new files immediately
+    if (length(new_files) > 0) {
+      .apply_new_files(new_files, existing, existing_meta, valid_rc, new_names)
+    }
+
+    # Queue conflicts and show first modal
+    if (length(conflicts) > 0) {
+      pending_conflicts_rv(conflicts)
+      .show_conflict_modal(conflicts[[1]])
+    }
+  })
+
+  # ── Helper: apply a named list of rc entries to state ─────────────
+  .apply_new_files <- function(
+    file_map,
+    existing,
+    existing_meta,
+    valid_rc,
+    new_names
+  ) {
     merged <- existing
-    for (i in seq_along(new_tbls)) {
-      merged[[new_names[i]]] <- new_tbls[[i]]
+    merged_meta <- existing_meta
+
+    for (nm in names(file_map)) {
+      rc <- file_map[[nm]]
+      merged[[nm]] <- rc$clean
+      merged_meta[[nm]] <- rc$meta
+    }
+    all_tables_rv(merged)
+    table_meta_rv(merged_meta)
+
+    # Rename log
+    log_rows <- lapply(names(file_map), function(nm) {
+      rc <- file_map[[nm]]
+      orig <- names(rc$raw)
+      cleaned <- names(rc$clean)
+      changed <- orig != cleaned
+      if (!any(changed)) {
+        return(NULL)
+      }
+      data.frame(
+        object_type = "column",
+        source = nm,
+        original_name = orig[changed],
+        cleaned_name = cleaned[changed],
+        stringsAsFactors = FALSE
+      )
+    })
+    log_rows <- Filter(Negate(is.null), log_rows)
+    if (length(log_rows) > 0) {
+      prev <- rename_log_rv()
+      prev <- prev[!prev$source %in% names(file_map), , drop = FALSE]
+      rename_log_rv(rbind(prev, do.call(rbind, log_rows)))
+    }
+
+    n <- length(file_map)
+    showNotification(
+      paste0(n, " table(s) added \u2014 ", length(merged), " total"),
+      type = "message",
+      duration = 4
+    )
+  }
+
+  # ── Show conflict resolution modal ────────────────────────────────
+  .show_conflict_modal <- function(conflict) {
+    nm <- conflict$name
+    ex <- conflict$existing_meta
+    inc <- conflict$incoming_meta
+
+    fmt_meta <- function(m) {
+      if (is.null(m)) {
+        return("unknown")
+      }
+      paste0(
+        format(m$nrow, big.mark = ","),
+        " rows \u00d7 ",
+        m$ncol,
+        " cols",
+        " | ",
+        round(m$size / 1024, 1),
+        " KB"
+      )
+    }
+
+    showModal(modalDialog(
+      title = tagList(
+        tags$span(
+          style = "color:#f59e0b;font-family:'IBM Plex Mono',monospace;",
+          paste0("\u26a0 Duplicate table name: '", nm, "'")
+        )
+      ),
+      tags$p(
+        style = "font-size:13px;color:#94a3b8;",
+        "A table named ",
+        tags$b(nm),
+        " is already loaded. The incoming file has different metadata:"
+      ),
+      tags$table(
+        style = "width:100%;border-collapse:collapse;font-family:'IBM Plex Mono',monospace;font-size:12px;",
+        tags$thead(
+          tags$tr(
+            tags$th(
+              style = "padding:6px 10px;border-bottom:1px solid #334155;color:#64748b;text-align:left;",
+              ""
+            ),
+            tags$th(
+              style = "padding:6px 10px;border-bottom:1px solid #334155;color:#60a5fa;text-align:left;",
+              "Existing"
+            ),
+            tags$th(
+              style = "padding:6px 10px;border-bottom:1px solid #334155;color:#4ade80;text-align:left;",
+              "Incoming"
+            )
+          )
+        ),
+        tags$tbody(
+          tags$tr(
+            tags$td(style = "padding:5px 10px;color:#64748b;", "Dimensions"),
+            tags$td(
+              style = "padding:5px 10px;",
+              if (!is.null(ex)) {
+                paste0(format(ex$nrow, big.mark = ","), " \u00d7 ", ex$ncol)
+              } else {
+                "—"
+              }
+            ),
+            tags$td(
+              style = "padding:5px 10px;",
+              paste0(format(inc$nrow, big.mark = ","), " \u00d7 ", inc$ncol)
+            )
+          ),
+          tags$tr(
+            tags$td(style = "padding:5px 10px;color:#64748b;", "File size"),
+            tags$td(
+              style = "padding:5px 10px;",
+              if (!is.null(ex)) paste0(round(ex$size / 1024, 1), " KB") else "—"
+            ),
+            tags$td(
+              style = "padding:5px 10px;",
+              paste0(round(inc$size / 1024, 1), " KB")
+            )
+          )
+        )
+      ),
+      br(),
+      tags$p(
+        style = "font-size:12px;color:#64748b;",
+        "How should this be resolved?"
+      ),
+      footer = tagList(
+        actionButton(
+          "conflict_overwrite",
+          "\u2b06 Replace existing",
+          style = "background:#1e3a5f;color:#60a5fa;border:1px solid #334155;font-size:12px;"
+        ),
+        actionButton(
+          "conflict_keep_both",
+          "\u2795 Keep both (rename incoming to '",
+          tags$code(paste0(nm, "_2")),
+          "')",
+          style = "background:#0c2a1a;color:#4ade80;border:1px solid #14532d;font-size:12px;"
+        ),
+        actionButton(
+          "conflict_skip",
+          "\u274c Skip incoming",
+          style = "background:#1a0a0a;color:#f87171;border:1px solid #7f1d1d;font-size:12px;"
+        )
+      ),
+      easyClose = FALSE,
+      size = "m"
+    ))
+  }
+
+  # ── Conflict resolution handlers ──────────────────────────────────
+  resolve_conflict <- function(action) {
+    conflicts <- pending_conflicts_rv()
+    if (length(conflicts) == 0) {
+      return()
+    }
+
+    conflict <- conflicts[[1]]
+    nm <- conflict$name
+    rc <- conflict$rc
+
+    existing <- all_tables_rv()
+    existing_meta <- table_meta_rv()
+
+    if (action == "overwrite") {
+      existing[[nm]] <- rc$clean
+      existing_meta[[nm]] <- rc$meta
+      all_tables_rv(existing)
+      table_meta_rv(existing_meta)
+      # Update rename log
+      orig <- names(rc$raw)
+      cleaned <- names(rc$clean)
+      changed <- orig != cleaned
+      if (any(changed)) {
+        prev <- rename_log_rv()
+        prev <- prev[prev$source != nm, , drop = FALSE]
+        rename_log_rv(rbind(
+          prev,
+          data.frame(
+            object_type = rep("column", sum(changed)),
+            source = nm,
+            original_name = orig[changed],
+            cleaned_name = cleaned[changed],
+            stringsAsFactors = FALSE
+          )
+        ))
+      }
+      showNotification(
+        paste0("'", nm, "' replaced."),
+        type = "message",
+        duration = 3
+      )
+    } else if (action == "keep_both") {
+      # Find a free name: nm_2, nm_3, ...
+      new_nm <- nm
+      suffix <- 2
+      while (new_nm %in% names(existing)) {
+        new_nm <- paste0(nm, "_", suffix)
+        suffix <- suffix + 1
+      }
+      existing[[new_nm]] <- rc$clean
+      existing_meta[[new_nm]] <- rc$meta
+      all_tables_rv(existing)
+      table_meta_rv(existing_meta)
+      orig <- names(rc$raw)
+      cleaned <- names(rc$clean)
+      changed <- orig != cleaned
+      if (any(changed)) {
+        prev <- rename_log_rv()
+        rename_log_rv(rbind(
+          prev,
+          data.frame(
+            object_type = rep("column", sum(changed)),
+            source = new_nm,
+            original_name = orig[changed],
+            cleaned_name = cleaned[changed],
+            stringsAsFactors = FALSE
+          )
+        ))
+      }
+      showNotification(
+        paste0("Saved as '", new_nm, "'."),
+        type = "message",
+        duration = 3
+      )
+    } else {
+      # skip
+      showNotification(
+        paste0("'", nm, "' incoming file discarded."),
+        type = "warning",
+        duration = 3
+      )
+    }
+
+    removeModal()
+    remaining <- conflicts[-1]
+    pending_conflicts_rv(remaining)
+    if (length(remaining) > 0) .show_conflict_modal(remaining[[1]])
+  }
+
+  observeEvent(input$conflict_overwrite, resolve_conflict("overwrite"))
+  observeEvent(input$conflict_keep_both, resolve_conflict("keep_both"))
+  observeEvent(input$conflict_skip, resolve_conflict("skip"))
+
+  # ---- Add Access DB when mdb fileInput fires ----
+  observeEvent(input$mdb_file, {
+    req(input$mdb_file)
+    path <- input$mdb_file$datapath
+    src_name <- tools::file_path_sans_ext(input$mdb_file$name)
+    existing <- all_tables_rv()
+
+    errors <- character(0)
+    notify_fn <- function(msg) {
+      errors <<- c(errors, msg)
+    }
+
+    raw_tbls <- withProgress(
+      message = paste0("Reading ", input$mdb_file$name, "..."),
+      value = 0.3,
+      read_access_db(path, notify_fn)
+    )
+
+    for (e in errors) {
+      showNotification(e, type = "error", duration = 12)
+    }
+    if (length(raw_tbls) == 0) {
+      return()
+    }
+
+    # Clean column names and record renames
+    log_rows <- list()
+    clean_tbls <- setNames(
+      lapply(names(raw_tbls), function(tname) {
+        raw_df <- raw_tbls[[tname]]
+        clean_df <- janitor::clean_names(raw_df)
+        orig <- names(raw_df)
+        cleaned <- names(clean_df)
+        changed <- orig != cleaned
+        if (any(changed)) {
+          log_rows[[length(log_rows) + 1]] <<- data.frame(
+            object_type = "column",
+            source = tname,
+            original_name = orig[changed],
+            cleaned_name = cleaned[changed],
+            stringsAsFactors = FALSE
+          )
+        }
+        clean_df
+      }),
+      names(raw_tbls)
+    )
+
+    # Merge into accumulated state
+    merged <- existing
+    for (nm in names(clean_tbls)) {
+      merged[[nm]] <- clean_tbls[[nm]]
     }
     all_tables_rv(merged)
 
-    # Build rename log for changed names in this batch
-    valid_rc <- raw_and_clean[valid]
-    new_rows <- do.call(
-      rbind,
-      lapply(seq_along(valid_rc), function(i) {
-        rc <- valid_rc[[i]]
-        tname <- new_names[i]
-        orig_cols <- names(rc$raw)
-        clean_cols <- names(rc$clean)
-        changed <- orig_cols != clean_cols
-        if (!any(changed)) {
-          return(NULL)
-        }
-        data.frame(
-          object_type = "column",
-          source = tname,
-          original_name = orig_cols[changed],
-          cleaned_name = clean_cols[changed],
-          stringsAsFactors = FALSE
-        )
-      })
-    )
-
-    if (!is.null(new_rows) && nrow(new_rows) > 0) {
-      existing_log <- rename_log_rv()
-      # Drop old entries for tables being replaced, then append
-      existing_log <- existing_log[
-        !existing_log$source %in% new_names,
+    # Append rename log, dropping stale entries for replaced tables
+    if (length(log_rows) > 0) {
+      prev_log <- rename_log_rv()
+      prev_log <- prev_log[
+        !prev_log$source %in% names(clean_tbls),
         ,
         drop = FALSE
       ]
-      rename_log_rv(rbind(existing_log, new_rows))
+      rename_log_rv(rbind(prev_log, do.call(rbind, log_rows)))
     }
 
-    n_replaced <- sum(new_names %in% names(existing))
-    n_added <- length(new_tbls) - n_replaced
+    n_replaced <- sum(names(clean_tbls) %in% names(existing))
+    n_added <- length(clean_tbls) - n_replaced
     parts <- character(0)
     if (n_added > 0) {
-      parts <- c(parts, paste0(n_added, " added"))
+      parts <- c(parts, paste0(n_added, " table(s) added"))
     }
     if (n_replaced > 0) {
       parts <- c(parts, paste0(n_replaced, " replaced"))
     }
     showNotification(
       paste0(
+        src_name,
+        ": ",
         paste(parts, collapse = ", "),
         " \u2014 ",
         length(merged),
-        " table(s) total"
+        " total"
       ),
       type = "message",
-      duration = 4
+      duration = 5
     )
   })
-
-  # ---- Remove individual table ----
   observeEvent(input$remove_table_name, {
     nm <- input$remove_table_name
     tbl <- all_tables_rv()
     tbl[[nm]] <- NULL
     all_tables_rv(tbl)
+    meta <- table_meta_rv()
+    meta[[nm]] <- NULL
+    table_meta_rv(meta)
     log <- rename_log_rv()
     rename_log_rv(log[log$source != nm, , drop = FALSE])
     showNotification(paste0("Removed: ", nm), type = "message", duration = 3)
@@ -1090,6 +1649,7 @@ server <- function(input, output, session) {
   # ---- Clear all tables ----
   observeEvent(input$btn_clear_tables, {
     all_tables_rv(list())
+    table_meta_rv(list())
     rename_log_rv(data.frame(
       object_type = character(),
       source = character(),
@@ -1346,47 +1906,72 @@ server <- function(input, output, session) {
     pks <- pk_map_rv()
     rels <- all_rels_rv()
 
-    lapply(names(tbls), function(t) {
-      df <- tbls[[t]]
-      pk_v <- pks[[t]]
-      fk_rels <- Filter(function(r) r$from_table == t, rels)
-      fk_cols <- vapply(fk_rels, `[[`, character(1), "from_col")
-
-      pills <- tagList(
-        span(
-          class = "pill pill-rows",
-          paste0(format(nrow(df), big.mark = ","), " rows")
-        ),
-        span(class = "pill pill-cols", paste0(ncol(df), " cols")),
-        if (length(pk_v) > 0) {
-          lapply(pk_v, function(p) {
-            span(class = "pill pill-pk", paste0("PK: ", p))
-          })
-        } else {
-          span(class = "pill pill-warn", "⚠ no PK")
-        },
-        if (length(fk_cols) > 0) {
-          lapply(seq_along(fk_rels), function(i) {
-            span(
-              class = "pill pill-fk",
-              paste0(
-                "FK: ",
-                fk_rels[[i]]$from_col,
-                " → ",
-                fk_rels[[i]]$to_table
-              )
-            )
-          })
-        }
-      )
-
+    tagList(
+      # Export All button at the top
       div(
-        class = "tbl-card",
-        p(class = "tbl-card-title", paste0("[ ", t, " ]")),
-        div(style = "margin-bottom: 12px;", pills),
-        DTOutput(paste0("dt_col_", make.names(t)))
-      )
-    })
+        style = "display:flex; justify-content:flex-end; margin-bottom:12px;",
+        downloadButton(
+          "dl_all_table_details",
+          "\u2b07  Export All Tables (CSV)",
+          class = "dl-btn"
+        )
+      ),
+      lapply(names(tbls), function(t) {
+        df <- tbls[[t]]
+        pk_v <- pks[[t]]
+        fk_rels <- Filter(function(r) r$from_table == t, rels)
+        fk_cols <- vapply(fk_rels, `[[`, character(1), "from_col")
+        dl_id <- paste0("dl_tbl_", make.names(t))
+
+        pills <- tagList(
+          span(
+            class = "pill pill-rows",
+            paste0(format(nrow(df), big.mark = ","), " rows")
+          ),
+          span(class = "pill pill-cols", paste0(ncol(df), " cols")),
+          if (length(pk_v) > 0) {
+            lapply(pk_v, function(p) {
+              span(class = "pill pill-pk", paste0("PK: ", p))
+            })
+          } else {
+            span(class = "pill pill-warn", "\u26a0 no PK")
+          },
+          if (length(fk_cols) > 0) {
+            lapply(seq_along(fk_rels), function(i) {
+              span(
+                class = "pill pill-fk",
+                paste0(
+                  "FK: ",
+                  fk_rels[[i]]$from_col,
+                  " \u2192 ",
+                  fk_rels[[i]]$to_table
+                )
+              )
+            })
+          }
+        )
+
+        div(
+          class = "tbl-card",
+          div(
+            style = "display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;",
+            p(
+              class = "tbl-card-title",
+              style = "margin:0;",
+              paste0("[ ", t, " ]")
+            ),
+            downloadButton(
+              dl_id,
+              "\u2b07 CSV",
+              class = "dl-btn",
+              style = "padding:4px 10px; font-size:11px;"
+            )
+          ),
+          div(style = "margin-bottom: 12px;", pills),
+          DTOutput(paste0("dt_col_", make.names(t)))
+        )
+      })
+    )
   })
 
   # Dynamic DT outputs
@@ -1456,6 +2041,82 @@ server <- function(input, output, session) {
       })
     })
   })
+
+  # Helper: build column-summary data.frame for one table
+  make_tbl_summary <- function(t, tbls, pks, rels) {
+    df <- tbls[[t]]
+    pk_v <- pks[[t]]
+    fk_rels <- Filter(function(r) r$from_table == t, rels)
+    fk_cols <- vapply(fk_rels, `[[`, character(1), "from_col")
+    data.frame(
+      table = t,
+      column = names(df),
+      type = vapply(
+        df,
+        function(x) paste(class(x), collapse = "/"),
+        character(1)
+      ),
+      non_null = vapply(df, function(x) sum(!is.na(x)), integer(1)),
+      unique_vals = vapply(
+        df,
+        function(x) length(unique(na.omit(x))),
+        integer(1)
+      ),
+      is_pk = names(df) %in% pk_v,
+      is_fk = names(df) %in% fk_cols,
+      stringsAsFactors = FALSE
+    )
+  }
+
+  # Per-table download handlers (created dynamically)
+  observe({
+    tbls <- all_tables_rv()
+    req(length(tbls) > 0)
+    pks <- pk_map_rv()
+    rels <- all_rels_rv()
+    lapply(names(tbls), function(t) {
+      local({
+        tname <- t
+        dl_id <- paste0("dl_tbl_", make.names(tname))
+        output[[dl_id]] <- downloadHandler(
+          filename = function() paste0(tname, "_details.csv"),
+          content = function(file) {
+            write.csv(
+              make_tbl_summary(
+                tname,
+                all_tables_rv(),
+                pk_map_rv(),
+                all_rels_rv()
+              ),
+              file,
+              row.names = FALSE
+            )
+          }
+        )
+      })
+    })
+  })
+
+  # Export All: one CSV with all tables stacked, table column first
+  output$dl_all_table_details <- downloadHandler(
+    filename = "all_table_details.csv",
+    content = function(file) {
+      tbls <- all_tables_rv()
+      pks <- pk_map_rv()
+      rels <- all_rels_rv()
+      combined <- do.call(
+        rbind,
+        lapply(
+          names(tbls),
+          make_tbl_summary,
+          tbls = tbls,
+          pks = pks,
+          rels = rels
+        )
+      )
+      write.csv(combined, file, row.names = FALSE)
+    }
+  )
 
   # ---- Relationships Tab ----
   output$relationships_ui <- renderUI({
