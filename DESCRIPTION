@@ -1,0 +1,32 @@
+Type: Shiny
+Package: tableexplorer
+Title: Table Relationship Explorer
+Version: 0.2.0
+Description: Interactive Shiny app for exploring table relationships with
+    multi-signal FK detection, ERD visualization, and multi-format file support.
+Depends:
+    R (>= 4.1.0)
+Imports:
+    shiny,
+    visNetwork,
+    DT,
+    shinythemes,
+    janitor
+Suggests:
+    testthat (>= 3.0.0),
+    jsonlite,
+    readxl,
+    arrow,
+    haven,
+    readODS,
+    DBI,
+    RSQLite,
+    RPostgres,
+    RMariaDB,
+    odbc,
+    bigrquery,
+    stringdist,
+    RJDBC,
+    RODBC,
+    yaml
+Config/testthat/edition: 3

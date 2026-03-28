@@ -9,359 +9,19 @@ library(DT)
 library(shinythemes)
 library(janitor)
 
+# Remove file upload size limit when running locally (Shiny default is 5 MB)
+# On deployed servers (Posit Connect, etc.) the proxy may still impose its own limit
+options(shiny.maxRequestSize = Inf)
+
+# Source modular components
+source("inference.R")
+source("file_readers.R")
+source("export_utils.R")
+source("db_connectors.R")
+
 # ============================================================
-# Helper Functions
+# Visualization
 # ============================================================
-
-# Normalise one or more names the same way janitor::clean_names() does:
-# lowercase, non-alphanumeric -> "_", collapse/trim underscores.
-clean_name <- function(name) janitor::make_clean_names(name)
-
-# ---- Access database reader ----------------------------------------
-# Strategy 1 (all platforms): RJDBC + UCanAccess pure-Java JDBC driver.
-#   Requires: install.packages("RJDBC") and Java (usually pre-installed).
-#   JARs are downloaded once to a local cache folder on first use.
-# Strategy 2 (Windows fallback): RODBC.
-#   Requires: install.packages("RODBC") + Microsoft Access Database Engine.
-# Returns a named list of data.frames, one per user table.
-# Errors are passed to notify_fn(msg) rather than thrown.
-
-# Default JAR cache location (alongside app.R, or in user cache dir)
-access_jar_dir <- function() {
-  app_jars <- file.path(dirname(sys.frame(1)$ofile %||% "."), "access_jars")
-  if (dir.exists(app_jars) || dir.create(app_jars, showWarnings = FALSE)) {
-    return(app_jars)
-  }
-  tools::R_user_dir("table_explorer_access_jars", "cache")
-}
-
-`%||%` <- function(a, b) if (!is.null(a) && length(a) > 0 && nzchar(a)) a else b
-
-# UCanAccess JARs from Maven Central (stable long-lived URLs)
-ucanaccess_jars <- list(
-  list(
-    file = "ucanaccess-5.0.1.jar",
-    url = "https://repo1.maven.org/maven2/net/sf/ucanaccess/ucanaccess/5.0.1/ucanaccess-5.0.1.jar"
-  ),
-  list(
-    file = "jackcess-4.0.1.jar",
-    url = "https://repo1.maven.org/maven2/com/healthmarketscience/jackcess/jackcess/4.0.1/jackcess-4.0.1.jar"
-  ),
-  list(
-    file = "commons-lang3-3.12.0.jar",
-    url = "https://repo1.maven.org/maven2/org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar"
-  ),
-  list(
-    file = "commons-logging-1.2.jar",
-    url = "https://repo1.maven.org/maven2/commons-logging/commons-logging/1.2/commons-logging-1.2.jar"
-  ),
-  list(
-    file = "hsqldb-2.7.1.jar",
-    url = "https://repo1.maven.org/maven2/org/hsqldb/hsqldb/2.7.1/hsqldb-2.7.1.jar"
-  )
-)
-
-ensure_ucanaccess_jars <- function(jar_dir, notify_fn) {
-  if (!dir.exists(jar_dir)) {
-    dir.create(jar_dir, recursive = TRUE, showWarnings = FALSE)
-  }
-  for (j in ucanaccess_jars) {
-    dest <- file.path(jar_dir, j$file)
-    if (!file.exists(dest)) {
-      notify_fn(paste0("Downloading ", j$file, "..."))
-      tryCatch(
-        utils::download.file(j$url, dest, mode = "wb", quiet = TRUE),
-        error = function(e) {
-          notify_fn(paste0(
-            "Failed to download ",
-            j$file,
-            ": ",
-            conditionMessage(e)
-          ))
-        }
-      )
-    }
-  }
-  jar_paths <- file.path(
-    jar_dir,
-    vapply(ucanaccess_jars, `[[`, character(1), "file")
-  )
-  all(file.exists(jar_paths))
-}
-
-read_access_db <- function(path, notify_fn = message) {
-  # ── Strategy 1: RJDBC + UCanAccess (all platforms, needs Java) ──
-  if (requireNamespace("RJDBC", quietly = TRUE)) {
-    jar_dir <- tryCatch(
-      file.path(dirname(normalizePath(path, mustWork = FALSE)), "access_jars"),
-      error = function(e) tools::R_user_dir("table_explorer", "cache")
-    )
-    jars_ok <- tryCatch(
-      ensure_ucanaccess_jars(jar_dir, notify_fn),
-      error = function(e) FALSE
-    )
-
-    if (jars_ok) {
-      jar_paths <- file.path(
-        jar_dir,
-        vapply(ucanaccess_jars, `[[`, character(1), "file")
-      )
-      result <- tryCatch(
-        {
-          drv <- RJDBC::JDBC(
-            driverClass = "net.ucanaccess.jdbc.UcanaccessDriver",
-            classPath = jar_paths
-          )
-          jdbc_url <- paste0(
-            "jdbc:ucanaccess://",
-            normalizePath(path, winslash = "/")
-          )
-          con <- DBI::dbConnect(drv, jdbc_url)
-          on.exit(
-            tryCatch(DBI::dbDisconnect(con), error = function(e) NULL),
-            add = TRUE
-          )
-
-          # List user tables only (skip system tables starting with "MSys")
-          all_tables <- DBI::dbListTables(con)
-          user_tables <- all_tables[!grepl("^MSys|^USys|^~", all_tables)]
-
-          tbls <- setNames(
-            lapply(user_tables, function(tname) {
-              tryCatch(
-                DBI::dbReadTable(con, tname),
-                error = function(e) {
-                  notify_fn(paste0(
-                    "Could not read table '",
-                    tname,
-                    "': ",
-                    conditionMessage(e)
-                  ))
-                  NULL
-                }
-              )
-            }),
-            user_tables
-          )
-          Filter(Negate(is.null), tbls)
-        },
-        error = function(e) {
-          notify_fn(paste0(
-            "RJDBC/UCanAccess error: ",
-            conditionMessage(e),
-            " — is Java installed? Run `Sys.getenv('JAVA_HOME')` to check."
-          ))
-          NULL
-        }
-      )
-      if (!is.null(result) && length(result) > 0) return(result)
-    }
-  }
-
-  # ── Strategy 2: RODBC (Windows — needs Access Database Engine) ───
-  if (
-    requireNamespace("RODBC", quietly = TRUE) && .Platform$OS.type == "windows"
-  ) {
-    result <- tryCatch(
-      {
-        con <- RODBC::odbcConnectAccess2007(path)
-        if (inherits(con, "RODBC")) {
-          on.exit(RODBC::odbcClose(con), add = TRUE)
-          tnames <- RODBC::sqlTables(con, tableType = "TABLE")$TABLE_NAME
-          tbls <- setNames(
-            lapply(tnames, function(tname) {
-              tryCatch(
-                RODBC::sqlFetch(con, tname, stringsAsFactors = FALSE),
-                error = function(e) {
-                  notify_fn(paste0(
-                    "RODBC: could not fetch '",
-                    tname,
-                    "': ",
-                    conditionMessage(e)
-                  ))
-                  NULL
-                }
-              )
-            }),
-            tnames
-          )
-          Filter(Negate(is.null), tbls)
-        } else {
-          NULL
-        }
-      },
-      error = function(e) NULL
-    )
-    if (!is.null(result) && length(result) > 0) return(result)
-  }
-
-  # ── No strategy succeeded ────────────────────────────────────────
-  notify_fn(paste0(
-    "Could not read Access file. ",
-    "Install the RJDBC package (install.packages('RJDBC')) and ensure Java is available. ",
-    "The required UCanAccess JARs will be downloaded automatically on first use. ",
-    "On Windows, RODBC + the Microsoft Access Database Engine are also accepted."
-  ))
-  list()
-}
-
-# Extract the stem from an _id column: "document_id" -> "document"
-id_stem <- function(col_clean) sub("_id$", "", col_clean)
-
-# Does a cleaned column name look like a PK for this table?
-# Handles: exact "id", exact "{table}_id", and stem-prefix match
-# e.g. "document_id" matches table "documents" because "documents" starts with "document"
-is_pk_name <- function(col_clean, tname_clean) {
-  col_clean == "id" ||
-    col_clean == paste0(tname_clean, "_id") ||
-    (grepl("_id$", col_clean) && startsWith(tname_clean, id_stem(col_clean)))
-}
-
-# Does a cleaned column name look like a FK pointing at table t2?
-# Same stem-prefix logic in reverse.
-is_fk_for <- function(col_clean, t2clean) {
-  col_clean == paste0(t2clean, "_id") ||
-    (grepl("_id$", col_clean) && startsWith(t2clean, id_stem(col_clean)))
-}
-
-detect_pks <- function(df, table_name, method = "both") {
-  cols <- names(df)
-  candidates <- character(0)
-  n <- nrow(df)
-
-  if (method %in% c("naming", "both")) {
-    tname <- clean_name(table_name)
-    cols_clean <- clean_name(cols)
-    hits <- cols[vapply(
-      cols_clean,
-      is_pk_name,
-      logical(1),
-      tname_clean = tname
-    )]
-    candidates <- union(candidates, hits)
-  }
-
-  if (method %in% c("uniqueness", "both") && n > 0) {
-    hits <- cols[vapply(
-      cols,
-      function(c) {
-        v <- df[[c]]
-        !anyNA(v) && length(unique(v)) == n
-      },
-      logical(1)
-    )]
-    candidates <- union(candidates, hits)
-  }
-
-  candidates
-}
-
-detect_fks <- function(tables, method = "both") {
-  rels <- list()
-  seen <- character(0) # fast set: "t1|col|t2" keys already added
-  tnames <- names(tables)
-  if (method == "manual" || length(tnames) < 2) {
-    return(rels)
-  }
-
-  # Pre-compute PK columns (all-unique, no-NA) per table for uniqueness matching
-  pk_map <- lapply(tnames, function(t) {
-    df <- tables[[t]]
-    n <- nrow(df)
-    if (n == 0) {
-      return(character(0))
-    }
-    names(df)[vapply(
-      names(df),
-      function(c) !anyNA(df[[c]]) && length(unique(df[[c]])) == n,
-      logical(1)
-    )]
-  })
-  names(pk_map) <- tnames
-
-  for (t1 in tnames) {
-    df1 <- tables[[t1]]
-    n1 <- nrow(df1)
-
-    for (col in names(df1)) {
-      if (col %in% pk_map[[t1]]) {
-        next
-      } # skip PKs of the same table
-
-      for (t2 in tnames) {
-        if (t2 == t1) {
-          next
-        }
-
-        # Skip if already have a rel for this (t1, col, t2) pair
-        rel_key <- paste(t1, col, t2, sep = "|")
-        if (rel_key %in% seen) {
-          next
-        }
-
-        df2 <- tables[[t2]]
-        t2clean <- clean_name(t2)
-
-        # --- Naming convention ---
-        if (method %in% c("naming", "both")) {
-          col_clean <- clean_name(col)
-          if (is_fk_for(col_clean, t2clean)) {
-            pk_col <- if (length(pk_map[[t2]]) > 0) {
-              pk_map[[t2]][1]
-            } else {
-              NA_character_
-            }
-            rels[[length(rels) + 1]] <- list(
-              from_table = t1,
-              from_col = col,
-              to_table = t2,
-              to_col = pk_col,
-              detected_by = "naming"
-            )
-            seen <- c(seen, rel_key)
-            next
-          }
-        }
-
-        # --- Uniqueness / value-subset ---
-        # Guard: only consider columns whose name ends in _id/_key.
-        # Also skip if the source table is very large (>100k rows) or very wide (>200 cols)
-        # to avoid O(n) scans that freeze the app.
-        col_clean_u <- clean_name(col)
-        looks_like_key <- grepl("(_id|_key|id$|key$)", col_clean_u)
-        too_large <- n1 > 100000 || ncol(df1) > 200
-        if (
-          method %in%
-            c("uniqueness", "both") &&
-            looks_like_key &&
-            !too_large &&
-            n1 > 0 &&
-            length(pk_map[[t2]]) > 0
-        ) {
-          vals1 <- na.omit(df1[[col]])
-          if (length(vals1) == 0) {
-            next
-          }
-          for (pk_col in pk_map[[t2]]) {
-            if (all(vals1 %in% df2[[pk_col]])) {
-              rels[[length(rels) + 1]] <- list(
-                from_table = t1,
-                from_col = col,
-                to_table = t2,
-                to_col = pk_col,
-                detected_by = "uniqueness"
-              )
-              seen <- c(seen, rel_key)
-              break
-            }
-          }
-        }
-      }
-    }
-  }
-  rels
-}
-
 
 build_network <- function(tables, rels, pk_map) {
   tnames <- names(tables)
@@ -447,31 +107,38 @@ build_network <- function(tables, rels, pk_map) {
           "<div style='border-top:1px solid #1e3a5f;padding-top:8px;'>",
           "<span style='color:#64748b;font-size:10px;letter-spacing:1px;'>COLUMNS</span>",
           "<div style='display:flex;flex-wrap:wrap;gap:3px;margin-top:6px;'>",
-          paste(
-            vapply(
-              names(df),
-              function(cn) {
-                chip_bg <- if (cn %in% pks) {
-                  "background:#2a1a00;color:#fbbf24;border-color:#78350f;"
-                } else if (
-                  cn %in% vapply(fkr, `[[`, character(1), "from_col")
-                ) {
-                  "background:#1a0a2e;color:#c084fc;border-color:#4c1d95;"
-                } else {
-                  "background:rgba(255,255,255,0.04);color:#94a3b8;border-color:#1e3a5f;"
-                }
-                paste0(
-                  "<span style='",
-                  chip_bg,
-                  "border:1px solid;border-radius:4px;padding:1px 6px;font-size:10px;white-space:nowrap;'>",
-                  cn,
-                  "</span>"
-                )
-              },
-              character(1)
-            ),
-            collapse = ""
-          ),
+          {
+            col_names <- names(df)
+            show_cols <- if (length(col_names) > 12) col_names[1:12] else col_names
+            overflow <- if (length(col_names) > 12) {
+              paste0("<span style='color:#64748b;font-size:9px;'> +", length(col_names) - 12, " more</span>")
+            } else ""
+            paste0(paste(
+              vapply(
+                show_cols,
+                function(cn) {
+                  chip_bg <- if (cn %in% pks) {
+                    "background:#2a1a00;color:#fbbf24;border-color:#78350f;"
+                  } else if (
+                    cn %in% vapply(fkr, `[[`, character(1), "from_col")
+                  ) {
+                    "background:#1a0a2e;color:#c084fc;border-color:#4c1d95;"
+                  } else {
+                    "background:rgba(255,255,255,0.04);color:#94a3b8;border-color:#1e3a5f;"
+                  }
+                  paste0(
+                    "<span style='",
+                    chip_bg,
+                    "border:1px solid;border-radius:4px;padding:1px 6px;font-size:10px;white-space:nowrap;'>",
+                    cn,
+                    "</span>"
+                  )
+                },
+                character(1)
+              ),
+              collapse = ""
+            ), overflow)
+          },
           "</div>",
           "</div>",
           "</div>"
@@ -491,9 +158,16 @@ build_network <- function(tables, rels, pk_map) {
   )
 
   edge_method_color <- c(
-    naming = "#4ADE80",
-    uniqueness = "#FB923C",
-    manual = "#F87171"
+    naming          = "#4ADE80",
+    name_similarity = "#2DD4BF",
+    value_overlap   = "#FB923C",
+    cardinality     = "#FACC15",
+    format          = "#60A5FA",
+    distribution    = "#A78BFA",
+    null_pattern    = "#F0ABFC",
+    content         = "#FB923C",
+    manual          = "#F87171",
+    schema          = "#67E8F9"
   )
 
   if (length(rels) == 0) {
@@ -511,6 +185,34 @@ build_network <- function(tables, rels, pk_map) {
       lapply(rels, function(r) {
         to_col <- if (!is.na(r$to_col) && !is.null(r$to_col)) r$to_col else "?"
         ecol <- edge_method_color[r$detected_by]
+        if (is.na(ecol)) ecol <- "#FB923C"
+
+        # Confidence-based edge styling
+        conf <- if (!is.null(r$confidence)) r$confidence else "medium"
+        score_val <- if (!is.null(r$score)) r$score else NA
+        conf_opacity <- switch(conf, high = 0.95, medium = 0.60, low = 0.28, 0.60)
+        conf_width <- switch(conf, high = 2.5, medium = 1.5, low = 0.8, 1.5)
+
+        # Confidence line for tooltip
+        conf_html <- ""
+        if (!is.na(score_val)) {
+          conf_color <- switch(conf, high = "#4ade80", medium = "#facc15", low = "#f87171", "#94a3b8")
+          conf_html <- paste0(
+            "<br><span style='color:", conf_color, ";font-size:10px;'>",
+            "&#9679; ", conf, " (", round(score_val * 100), "%)</span>"
+          )
+        }
+
+        # Reasons for tooltip
+        reasons_html <- ""
+        if (!is.null(r$reasons) && length(r$reasons) > 0) {
+          reasons_html <- paste0(
+            "<br><span style='color:#94a3b8;font-size:9px;'>",
+            paste(r$reasons, collapse = " &bull; "),
+            "</span>"
+          )
+        }
+
         data.frame(
           from = name_to_id[[r$from_table]],
           to = name_to_id[[r$to_table]],
@@ -541,13 +243,16 @@ build_network <- function(tables, rels, pk_map) {
             ";font-size:10px;letter-spacing:0.5px;'>&#9632; ",
             toupper(r$detected_by),
             "</span>",
+            conf_html,
+            reasons_html,
             "</div>"
           ),
           arrows = "to",
           color.color = ecol,
           color.highlight = ecol,
-          color.opacity = 0.85,
-          dashes = (r$detected_by == "uniqueness"),
+          color.opacity = conf_opacity,
+          width = conf_width,
+          dashes = (conf == "low"),
           font.size = 10,
           font.color = "#e2e8f0",
           font.strokeWidth = 3,
@@ -780,12 +485,37 @@ ui <- fluidPage(
     .rel-col   { color: var(--text-secondary); font-family: "IBM Plex Mono", monospace; font-size: 12px; }
     .rel-arrow { color: var(--border-sub); font-size: 16px; }
     .rel-method { font-size: 10px; padding: 2px 7px; border-radius: 10px; font-family: "IBM Plex Mono", monospace; margin-left: auto; }
-    .m-naming    { background: #0c2a1a; color: #4ade80; }
-    .m-uniqueness { background: #1a1000; color: #fb923c; }
-    .m-manual    { background: #1a0a0a; color: #f87171; }
-    body.light-mode .m-naming    { background:#dcfce7; color:#15803d; }
-    body.light-mode .m-uniqueness { background:#fff7ed; color:#c2410c; }
-    body.light-mode .m-manual    { background:#fee2e2; color:#b91c1c; }
+    .m-naming          { background: #0c2a1a; color: #4ade80; }
+    .m-name_similarity { background: #0c2a2a; color: #2dd4bf; }
+    .m-value_overlap   { background: #1a1000; color: #fb923c; }
+    .m-cardinality     { background: #1a1a00; color: #facc15; }
+    .m-format          { background: #0a1a2e; color: #60a5fa; }
+    .m-distribution    { background: #1a0a2e; color: #a78bfa; }
+    .m-null_pattern    { background: #1a1020; color: #f0abfc; }
+    .m-content         { background: #1a1000; color: #fb923c; }
+    .m-manual          { background: #1a0a0a; color: #f87171; }
+    .m-schema          { background: #0a1a1a; color: #67e8f9; }
+    body.light-mode .m-naming          { background:#dcfce7; color:#15803d; }
+    body.light-mode .m-name_similarity { background:#ccfbf1; color:#0d9488; }
+    body.light-mode .m-value_overlap   { background:#fff7ed; color:#c2410c; }
+    body.light-mode .m-cardinality     { background:#fefce8; color:#a16207; }
+    body.light-mode .m-format          { background:#dbeafe; color:#1d4ed8; }
+    body.light-mode .m-distribution    { background:#ede9fe; color:#6d28d9; }
+    body.light-mode .m-null_pattern    { background:#fae8ff; color:#a21caf; }
+    body.light-mode .m-content         { background:#fff7ed; color:#c2410c; }
+    body.light-mode .m-manual          { background:#fee2e2; color:#b91c1c; }
+    body.light-mode .m-schema          { background:#cffafe; color:#0e7490; }
+
+    /* Confidence indicators */
+    .conf-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:5px; }
+    .conf-high   { background:#4ade80; }
+    .conf-medium { background:#facc15; }
+    .conf-low    { background:#f87171; }
+    .conf-label  { font-size:10px; color:#94a3b8; margin-left:2px; font-family:"IBM Plex Mono",monospace; }
+    .signal-chips { display:inline-flex; gap:4px; flex-wrap:wrap; margin-left:8px; }
+    .signal-chip  { font-size:9px; padding:1px 5px; border-radius:6px; background:rgba(255,255,255,0.06); color:#94a3b8; font-family:"IBM Plex Mono",monospace; }
+    body.light-mode .signal-chip { background:rgba(0,0,0,0.06); color:#475569; }
+    body.light-mode .conf-label  { color:#475569; }
     .rel-section-hdr { font-family: "IBM Plex Mono", monospace; font-size: 11px; letter-spacing: 1.5px; text-transform: uppercase; padding: 10px 0 4px; color: var(--text-faint); }
 
     /* ── Legend ───────────────────────────────────────────────── */
@@ -971,27 +701,24 @@ ui <- fluidPage(
 
         div(class = "section-title", "01 // Upload Tables"),
         fileInput(
-          "csv_files",
+          "data_files",
           NULL,
           multiple = TRUE,
-          accept = ".csv",
+          accept = supported_extensions,
           placeholder = "No files selected",
-          buttonLabel = "Add CSV(s)"
-        ),
-        fileInput(
-          "mdb_file",
-          NULL,
-          multiple = FALSE,
-          accept = c(".mdb", ".accdb"),
-          placeholder = "No file selected",
-          buttonLabel = "Add Access DB"
+          buttonLabel = "Add File(s)"
         ),
         div(
-          style = "font-size:10px;color:var(--text-faint);margin-top:-8px;margin-bottom:4px;line-height:1.5;",
-          "Needs ",
-          tags$code("RJDBC"),
-          " package + Java.",
-          " JARs auto-download on first use."
+          style = "font-size:10px;color:var(--text-faint);margin-top:-8px;margin-bottom:8px;line-height:1.5;",
+          "CSV, TSV, Excel, Parquet, JSON, SPSS, SAS, Stata, RDS, RData, ODS, Access"
+        ),
+        fileInput(
+          "schema_file",
+          NULL,
+          multiple = FALSE,
+          accept = c(".json", ".yaml", ".yml"),
+          placeholder = "No file selected",
+          buttonLabel = "Import Schema"
         ),
         uiOutput("loaded_tables_ui"),
         actionButton(
@@ -1006,12 +733,18 @@ ui <- fluidPage(
           "detect_method",
           NULL,
           choices = c(
-            "Both (naming + uniqueness)" = "both",
+            "All signals (naming + content)" = "both",
             "Naming conventions only" = "naming",
-            "Uniqueness / value subset" = "uniqueness",
+            "Content analysis only" = "content",
             "Manual only" = "manual"
           ),
           selected = "both"
+        ),
+        selectInput(
+          "min_confidence",
+          "Minimum confidence:",
+          choices = c("low", "medium", "high"),
+          selected = "medium"
         ),
         div(
           style = "font-size: 11px; color: var(--text-faint); margin-top: -6px; line-height: 1.5;",
@@ -1019,11 +752,81 @@ ui <- fluidPage(
           tags$code("id"),
           ",",
           tags$code("{table}_id"),
-          "— Uniqueness: checks value overlap with other tables' PKs."
+          "— Content: uses value overlap, distribution similarity, format fingerprint, and more."
+        ),
+        conditionalPanel(
+          "input.detect_method == 'both' || input.detect_method == 'content'",
+          tags$details(
+            style = "margin-top: 8px;",
+            tags$summary(
+              style = "font-size: 11px; color: var(--text-muted); cursor: pointer; font-family: 'IBM Plex Mono', monospace;",
+              "Signal toggles"
+            ),
+            div(
+              style = "padding: 8px 0 0 4px;",
+              checkboxInput("fl_naming", "Naming convention", TRUE),
+              checkboxInput("fl_overlap", "Value overlap", TRUE),
+              checkboxInput("fl_card", "Cardinality match", TRUE),
+              checkboxInput("fl_fmt", "Format fingerprint", TRUE),
+              checkboxInput("fl_dist", "Distribution similarity", TRUE),
+              checkboxInput("fl_null", "Null-pattern correlation", FALSE)
+            )
+          )
+        ),
+        conditionalPanel(
+          "input.detect_method != 'manual'",
+          actionButton(
+            "btn_run_detection",
+            "\u25b6  Run Detection",
+            class = "btn-primary",
+            style = "width:100%; margin-top:6px; margin-bottom:2px;"
+          )
         ),
 
         tags$hr(),
-        div(class = "section-title", "03 // Manual Override"),
+        div(class = "section-title", "03 // Database Connection"),
+        selectInput(
+          "db_type", NULL,
+          choices = c("(select)" = "", db_types),
+          selected = ""
+        ),
+        conditionalPanel(
+          "input.db_type != '' && input.db_type != 'sqlite' && input.db_type != 'bigquery'",
+          textInput("db_host", "Host:", placeholder = "localhost"),
+          textInput("db_port", "Port:", placeholder = "auto"),
+          textInput("db_name", "Database:", placeholder = "mydb"),
+          textInput("db_user", "User:"),
+          passwordInput("db_pass", "Password:"),
+          textInput("db_schema", "Schema:", value = "public")
+        ),
+        conditionalPanel(
+          "input.db_type == 'sqlite'",
+          fileInput("db_sqlite_file", NULL, accept = c(".db", ".sqlite", ".sqlite3"),
+                    buttonLabel = "Select SQLite")
+        ),
+        conditionalPanel(
+          "input.db_type == 'bigquery'",
+          textInput("db_bq_project", "Project ID:"),
+          textInput("db_bq_dataset", "Dataset:")
+        ),
+        conditionalPanel(
+          "input.db_type == 'sqlserver' || input.db_type == 'snowflake'",
+          textInput("db_driver", "ODBC Driver:", placeholder = "auto-detect")
+        ),
+        conditionalPanel(
+          "input.db_type != ''",
+          div(
+            style = "display:flex;gap:6px;margin-bottom:8px;",
+            actionButton("btn_db_connect", "Connect", class = "btn-add"),
+            actionButton("btn_db_disconnect", "Disconnect", class = "btn-danger-soft")
+          ),
+          uiOutput("db_status_ui"),
+          uiOutput("db_tables_ui"),
+          actionButton("btn_db_load", "Load Selected Tables", class = "btn-add")
+        ),
+
+        tags$hr(),
+        div(class = "section-title", "04 // Manual Override"),
         div(
           style = "font-size: 11px; color: #475569; margin-bottom: 8px;",
           "Add or override relationships directly."
@@ -1067,29 +870,39 @@ ui <- fluidPage(
             "output.has_tables == 'true'",
             div(
               class = "legend",
-              div(
-                class = "legend-item",
-                div(class = "legend-dot", style = "background:#4ADE80;"),
-                "naming"
-              ),
-              div(
-                class = "legend-item",
-                div(
-                  class = "legend-dot",
-                  style = "background:#FB923C; border-style:dashed;"
-                ),
-                "uniqueness (dashed)"
-              ),
-              div(
-                class = "legend-item",
-                div(class = "legend-dot", style = "background:#F87171;"),
-                "manual"
-              )
+              div(class = "legend-item",
+                  div(class = "legend-dot", style = "background:#4ADE80;"), "naming"),
+              div(class = "legend-item",
+                  div(class = "legend-dot", style = "background:#2DD4BF;"), "name similarity"),
+              div(class = "legend-item",
+                  div(class = "legend-dot", style = "background:#FB923C;"), "value overlap"),
+              div(class = "legend-item",
+                  div(class = "legend-dot", style = "background:#FACC15;"), "cardinality"),
+              div(class = "legend-item",
+                  div(class = "legend-dot", style = "background:#60A5FA;"), "format"),
+              div(class = "legend-item",
+                  div(class = "legend-dot", style = "background:#A78BFA;"), "distribution"),
+              div(class = "legend-item",
+                  div(class = "legend-dot", style = "background:#F0ABFC;"), "null pattern"),
+              div(class = "legend-item",
+                  div(class = "legend-dot", style = "background:#67E8F9;"), "schema"),
+              div(class = "legend-item",
+                  div(class = "legend-dot", style = "background:#F87171;"), "manual"),
+              div(class = "legend-item",
+                  div(class = "legend-dot", style = "background:#fff;border:1px dashed #64748b;"), "low confidence (dashed)")
+            ),
+            div(
+              style = "display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:8px;",
+              selectInput("erd_layout", "Layout:", width = "160px",
+                          choices = c("Force" = "force", "Hierarchical" = "hierarchical", "Circular" = "circular"),
+                          selected = "force"),
+              sliderInput("spring_length", "Spring length:", width = "200px",
+                          min = 80, max = 600, value = 220, step = 20)
             ),
             visNetworkOutput("erd_plot", height = "540px"),
             div(
               class = "erd-hint",
-              "drag nodes · scroll to zoom · hover for details · click to highlight connections"
+              "drag nodes \u00b7 scroll to zoom \u00b7 hover for details \u00b7 click to highlight connections"
             )
           )
         ),
@@ -1107,7 +920,34 @@ ui <- fluidPage(
         ),
 
         # --- Name Changes ---
-        tabPanel("Name Changes", br(), uiOutput("rename_log_ui"))
+        tabPanel("Name Changes", br(), uiOutput("rename_log_ui")),
+
+        # --- Export ---
+        tabPanel(
+          "Export",
+          br(),
+          div(
+            class = "sidebar-box",
+            style = "max-width:600px;",
+            div(class = "section-title", "Export Formats"),
+            div(
+              style = "display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px;",
+              downloadButton("dl_rels_csv", "Relationships CSV", class = "dl-btn"),
+              downloadButton("dl_dbt_yaml", "dbt schema.yml", class = "dl-btn"),
+              downloadButton("dl_mermaid", "Mermaid ERD", class = "dl-btn")
+            ),
+            tags$hr(),
+            div(class = "section-title", "Session"),
+            div(
+              style = "display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px;",
+              downloadButton("dl_session", "Save Session", class = "dl-btn"),
+              fileInput("restore_session_file", NULL,
+                        accept = ".json",
+                        buttonLabel = "Restore Session",
+                        placeholder = "No file selected")
+            )
+          )
+        )
       )
     )
   ),
@@ -1163,86 +1003,86 @@ server <- function(input, output, session) {
   pending_conflicts_rv <- reactiveVal(list())
 
   # ---- Add files when fileInput fires ----
-  observeEvent(input$csv_files, {
-    req(input$csv_files)
+  observeEvent(input$data_files, {
+    req(input$data_files)
     existing <- all_tables_rv()
     existing_meta <- table_meta_rv()
-    n_files <- nrow(input$csv_files)
+    n_files <- nrow(input$data_files)
 
-    # Read all files (raw + clean) with a progress bar
-    raw_and_clean <- withProgress(message = "Reading CSV files...", value = 0, {
+    errors <- character(0)
+    notify_fn <- function(msg) { errors <<- c(errors, msg) }
+
+    # Read all files with the multi-format dispatcher
+    all_results <- withProgress(message = "Reading files...", value = 0, {
       lapply(seq_len(n_files), function(i) {
-        incProgress(1 / n_files, detail = input$csv_files$name[i])
+        incProgress(1 / n_files, detail = input$data_files$name[i])
+        fname <- input$data_files$name[i]
+        fpath <- input$data_files$datapath[i]
+        fsize <- input$data_files$size[i]
         tryCatch(
           {
-            raw_df <- read.csv(
-              input$csv_files$datapath[i],
-              stringsAsFactors = FALSE,
-              check.names = FALSE
-            )
-            clean_df <- janitor::clean_names(raw_df)
-            finfo <- file.info(input$csv_files$datapath[i])
-            list(
-              ok = TRUE,
-              raw = raw_df,
-              clean = clean_df,
-              meta = list(
-                size = input$csv_files$size[i],
-                mtime = finfo$mtime,
-                nrow = nrow(clean_df),
-                ncol = ncol(clean_df)
+            result <- read_table_file(fpath, fname, notify_fn)
+            raw_tbls <- result$tables
+            if (length(raw_tbls) == 0) return(list(ok = FALSE, name = fname))
+            # Clean table + column names for each table
+            entries <- lapply(names(raw_tbls), function(tname) {
+              raw_df <- raw_tbls[[tname]]
+              clean_df <- janitor::clean_names(raw_df)
+              clean_tname <- janitor::make_clean_names(tname)
+              list(
+                ok = TRUE,
+                raw = raw_df,
+                clean = clean_df,
+                tname = clean_tname,
+                raw_tname = tname,
+                meta = list(
+                  size = fsize,
+                  nrow = nrow(clean_df),
+                  ncol = ncol(clean_df)
+                )
               )
-            )
+            })
+            entries
           },
           error = function(e) {
-            message(
-              "Read error on ",
-              input$csv_files$name[i],
-              ": ",
-              conditionMessage(e)
-            )
-            list(ok = FALSE)
+            notify_fn(paste0("Read error on ", fname, ": ", conditionMessage(e)))
+            list(list(ok = FALSE, name = fname))
           }
         )
       })
     })
 
-    valid <- vapply(raw_and_clean, `[[`, logical(1), "ok")
-    valid_rc <- raw_and_clean[valid]
-    new_names <- tools::file_path_sans_ext(input$csv_files$name[valid])
-    failed <- input$csv_files$name[!valid]
+    # Flatten: each file may produce multiple tables
+    flat <- do.call(c, all_results)
+    valid <- vapply(flat, function(x) isTRUE(x$ok), logical(1))
+    valid_entries <- flat[valid]
+    failed_entries <- flat[!valid]
 
-    for (fn in failed) {
-      showNotification(
-        paste0("Could not read: ", fn),
-        type = "error",
-        duration = 8
-      )
+    for (e in errors) {
+      showNotification(e, type = "error", duration = 8)
     }
-    if (length(valid_rc) == 0) {
-      showNotification(
-        "No valid CSV files could be loaded.",
-        type = "error",
-        duration = 8
-      )
+    for (fe in failed_entries) {
+      if (!is.null(fe$name)) {
+        showNotification(paste0("Could not read: ", fe$name), type = "error", duration = 8)
+      }
+    }
+    if (length(valid_entries) == 0) {
+      showNotification("No valid files could be loaded.", type = "error", duration = 8)
       return()
     }
 
-    # ── Classify each incoming file ──────────────────────────────────
-    new_files <- list() # name -> rc (no clash — just add)
-    exact_dupes <- character(0) # names that are exact duplicates
-    conflicts <- list() # list of conflict descriptors for the modal
+    # ── Classify each incoming table ─────────────────────────────────
+    new_files <- list()
+    exact_dupes <- character(0)
+    conflicts <- list()
 
-    for (i in seq_along(valid_rc)) {
-      nm <- new_names[i]
-      rc <- valid_rc[[i]]
-      inc <- rc$meta # incoming metadata
+    for (entry in valid_entries) {
+      nm <- entry$tname
+      inc <- entry$meta
 
       if (!nm %in% names(existing)) {
-        # No clash at all — straightforward add
-        new_files[[nm]] <- rc
+        new_files[[nm]] <- entry
       } else {
-        # Name clash — compare metadata
         ex <- existing_meta[[nm]]
         same_size <- !is.null(ex) &&
           identical(as.numeric(inc$size), as.numeric(ex$size))
@@ -1251,13 +1091,11 @@ server <- function(input, output, session) {
           identical(inc$ncol, ex$ncol)
 
         if (same_size && same_dims) {
-          # Almost certainly the same file
           exact_dupes <- c(exact_dupes, nm)
         } else {
-          # Different content — queue for user resolution
           conflicts[[length(conflicts) + 1]] <- list(
             name = nm,
-            rc = rc,
+            rc = entry,
             existing_meta = ex,
             incoming_meta = inc
           )
@@ -1265,25 +1103,18 @@ server <- function(input, output, session) {
       }
     }
 
-    # Warn about exact duplicates
     for (nm in exact_dupes) {
       showNotification(
-        paste0(
-          "\u26a0 '",
-          nm,
-          "': identical file already loaded — no changes made."
-        ),
-        type = "warning",
-        duration = 6
+        paste0("\u26a0 '", nm, "': identical file already loaded \u2014 no changes made."),
+        type = "warning", duration = 6
       )
     }
 
-    # Apply the non-conflicting new files immediately
     if (length(new_files) > 0) {
-      .apply_new_files(new_files, existing, existing_meta, valid_rc, new_names)
+      .apply_new_files(new_files, existing, existing_meta, valid_entries,
+                       vapply(valid_entries, `[[`, character(1), "tname"))
     }
 
-    # Queue conflicts and show first modal
     if (length(conflicts) > 0) {
       pending_conflicts_rv(conflicts)
       .show_conflict_modal(conflicts[[1]])
@@ -1309,24 +1140,41 @@ server <- function(input, output, session) {
     all_tables_rv(merged)
     table_meta_rv(merged_meta)
 
-    # Rename log
-    log_rows <- lapply(names(file_map), function(nm) {
+    # Rename log — table names + column names
+    log_rows <- list()
+
+    # Table name renames
+    for (nm in names(file_map)) {
+      rc <- file_map[[nm]]
+      raw_tname <- rc$raw_tname %||% nm
+      if (!is.null(raw_tname) && raw_tname != nm) {
+        log_rows[[length(log_rows) + 1]] <- data.frame(
+          object_type = "table",
+          source = nm,
+          original_name = raw_tname,
+          cleaned_name = nm,
+          stringsAsFactors = FALSE
+        )
+      }
+    }
+
+    # Column name renames
+    for (nm in names(file_map)) {
       rc <- file_map[[nm]]
       orig <- names(rc$raw)
       cleaned <- names(rc$clean)
       changed <- orig != cleaned
-      if (!any(changed)) {
-        return(NULL)
+      if (any(changed)) {
+        log_rows[[length(log_rows) + 1]] <- data.frame(
+          object_type = "column",
+          source = nm,
+          original_name = orig[changed],
+          cleaned_name = cleaned[changed],
+          stringsAsFactors = FALSE
+        )
       }
-      data.frame(
-        object_type = "column",
-        source = nm,
-        original_name = orig[changed],
-        cleaned_name = cleaned[changed],
-        stringsAsFactors = FALSE
-      )
-    })
-    log_rows <- Filter(Negate(is.null), log_rows)
+    }
+
     if (length(log_rows) > 0) {
       prev <- rename_log_rv()
       prev <- prev[!prev$source %in% names(file_map), , drop = FALSE]
@@ -1470,23 +1318,30 @@ server <- function(input, output, session) {
       existing_meta[[nm]] <- rc$meta
       all_tables_rv(existing)
       table_meta_rv(existing_meta)
-      # Update rename log
+      # Update rename log — table name + column names
+      prev <- rename_log_rv()
+      prev <- prev[prev$source != nm, , drop = FALSE]
+      new_rows <- list()
+      raw_tname <- rc$raw_tname %||% nm
+      if (!is.null(raw_tname) && raw_tname != nm) {
+        new_rows[[length(new_rows) + 1]] <- data.frame(
+          object_type = "table", source = nm,
+          original_name = raw_tname, cleaned_name = nm,
+          stringsAsFactors = FALSE
+        )
+      }
       orig <- names(rc$raw)
       cleaned <- names(rc$clean)
       changed <- orig != cleaned
       if (any(changed)) {
-        prev <- rename_log_rv()
-        prev <- prev[prev$source != nm, , drop = FALSE]
-        rename_log_rv(rbind(
-          prev,
-          data.frame(
-            object_type = rep("column", sum(changed)),
-            source = nm,
-            original_name = orig[changed],
-            cleaned_name = cleaned[changed],
-            stringsAsFactors = FALSE
-          )
-        ))
+        new_rows[[length(new_rows) + 1]] <- data.frame(
+          object_type = "column", source = nm,
+          original_name = orig[changed], cleaned_name = cleaned[changed],
+          stringsAsFactors = FALSE
+        )
+      }
+      if (length(new_rows) > 0) {
+        rename_log_rv(rbind(prev, do.call(rbind, new_rows)))
       }
       showNotification(
         paste0("'", nm, "' replaced."),
@@ -1505,21 +1360,28 @@ server <- function(input, output, session) {
       existing_meta[[new_nm]] <- rc$meta
       all_tables_rv(existing)
       table_meta_rv(existing_meta)
+      prev <- rename_log_rv()
+      new_rows <- list()
+      raw_tname <- rc$raw_tname %||% new_nm
+      if (!is.null(raw_tname) && raw_tname != new_nm) {
+        new_rows[[length(new_rows) + 1]] <- data.frame(
+          object_type = "table", source = new_nm,
+          original_name = raw_tname, cleaned_name = new_nm,
+          stringsAsFactors = FALSE
+        )
+      }
       orig <- names(rc$raw)
       cleaned <- names(rc$clean)
       changed <- orig != cleaned
       if (any(changed)) {
-        prev <- rename_log_rv()
-        rename_log_rv(rbind(
-          prev,
-          data.frame(
-            object_type = rep("column", sum(changed)),
-            source = new_nm,
-            original_name = orig[changed],
-            cleaned_name = cleaned[changed],
-            stringsAsFactors = FALSE
-          )
-        ))
+        new_rows[[length(new_rows) + 1]] <- data.frame(
+          object_type = "column", source = new_nm,
+          original_name = orig[changed], cleaned_name = cleaned[changed],
+          stringsAsFactors = FALSE
+        )
+      }
+      if (length(new_rows) > 0) {
+        rename_log_rv(rbind(prev, do.call(rbind, new_rows)))
       }
       showNotification(
         paste0("Saved as '", new_nm, "'."),
@@ -1545,94 +1407,220 @@ server <- function(input, output, session) {
   observeEvent(input$conflict_keep_both, resolve_conflict("keep_both"))
   observeEvent(input$conflict_skip, resolve_conflict("skip"))
 
-  # ---- Add Access DB when mdb fileInput fires ----
-  observeEvent(input$mdb_file, {
-    req(input$mdb_file)
-    path <- input$mdb_file$datapath
-    src_name <- tools::file_path_sans_ext(input$mdb_file$name)
-    existing <- all_tables_rv()
+  # ---- Schema file import ----
+  schema_rels_rv <- reactiveVal(list())
+
+  observeEvent(input$schema_file, {
+    req(input$schema_file)
+    path <- input$schema_file$datapath
+    fname <- input$schema_file$name
 
     errors <- character(0)
-    notify_fn <- function(msg) {
-      errors <<- c(errors, msg)
-    }
+    notify_fn <- function(msg) { errors <<- c(errors, msg) }
 
-    raw_tbls <- withProgress(
-      message = paste0("Reading ", input$mdb_file$name, "..."),
+    result <- withProgress(
+      message = paste0("Importing schema from ", fname, "..."),
       value = 0.3,
-      read_access_db(path, notify_fn)
+      parse_schema_file(path, fname, notify_fn)
     )
 
     for (e in errors) {
       showNotification(e, type = "error", duration = 12)
     }
-    if (length(raw_tbls) == 0) {
-      return()
-    }
 
-    # Clean column names and record renames
-    log_rows <- list()
-    clean_tbls <- setNames(
-      lapply(names(raw_tbls), function(tname) {
-        raw_df <- raw_tbls[[tname]]
-        clean_df <- janitor::clean_names(raw_df)
-        orig <- names(raw_df)
-        cleaned <- names(clean_df)
-        changed <- orig != cleaned
-        if (any(changed)) {
-          log_rows[[length(log_rows) + 1]] <<- data.frame(
-            object_type = "column",
-            source = tname,
-            original_name = orig[changed],
-            cleaned_name = cleaned[changed],
-            stringsAsFactors = FALSE
-          )
+    # Add schema-defined tables (empty data frames with column names)
+    if (length(result$tables) > 0) {
+      existing <- all_tables_rv()
+      schema_renames <- list()
+      for (nm in names(result$tables)) {
+        clean_nm <- janitor::make_clean_names(nm)
+        if (!clean_nm %in% names(existing)) {
+          existing[[clean_nm]] <- janitor::clean_names(result$tables[[nm]])
+          if (nm != clean_nm) {
+            schema_renames[[length(schema_renames) + 1]] <- data.frame(
+              object_type = "table", source = clean_nm,
+              original_name = nm, cleaned_name = clean_nm,
+              stringsAsFactors = FALSE
+            )
+          }
         }
-        clean_df
-      }),
-      names(raw_tbls)
-    )
-
-    # Merge into accumulated state
-    merged <- existing
-    for (nm in names(clean_tbls)) {
-      merged[[nm]] <- clean_tbls[[nm]]
-    }
-    all_tables_rv(merged)
-
-    # Append rename log, dropping stale entries for replaced tables
-    if (length(log_rows) > 0) {
-      prev_log <- rename_log_rv()
-      prev_log <- prev_log[
-        !prev_log$source %in% names(clean_tbls),
-        ,
-        drop = FALSE
-      ]
-      rename_log_rv(rbind(prev_log, do.call(rbind, log_rows)))
+      }
+      all_tables_rv(existing)
+      if (length(schema_renames) > 0) {
+        prev <- rename_log_rv()
+        rename_log_rv(rbind(prev, do.call(rbind, schema_renames)))
+      }
     }
 
-    n_replaced <- sum(names(clean_tbls) %in% names(existing))
-    n_added <- length(clean_tbls) - n_replaced
-    parts <- character(0)
-    if (n_added > 0) {
-      parts <- c(parts, paste0(n_added, " table(s) added"))
+    # Store schema relationships (clean table names to match)
+    if (length(result$relationships) > 0) {
+      clean_rels <- lapply(result$relationships, function(r) {
+        r$from_table <- janitor::make_clean_names(r$from_table)
+        r$to_table <- janitor::make_clean_names(r$to_table)
+        r
+      })
+      schema_rels_rv(clean_rels)
+      showNotification(
+        paste0("Schema imported: ", length(result$relationships), " relationship(s), ",
+               length(result$tables), " table(s)"),
+        type = "message", duration = 5
+      )
+    } else {
+      showNotification(
+        paste0("Schema imported: ", length(result$tables), " table(s), no relationships found."),
+        type = "message", duration = 5
+      )
     }
-    if (n_replaced > 0) {
-      parts <- c(parts, paste0(n_replaced, " replaced"))
+  })
+  # ---- Database connection ----
+  db_conn_rv <- reactiveVal(NULL)
+  db_meta_rv <- reactiveVal(NULL)
+
+  output$db_status_ui <- renderUI({
+    conn <- db_conn_rv()
+    if (is.null(conn)) {
+      div(style = "font-size:10px;color:var(--text-faint);margin-bottom:6px;", "Not connected")
+    } else {
+      div(style = "font-size:10px;color:#4ade80;margin-bottom:6px;", "\u2713 Connected")
     }
-    showNotification(
-      paste0(
-        src_name,
-        ": ",
-        paste(parts, collapse = ", "),
-        " \u2014 ",
-        length(merged),
-        " total"
-      ),
-      type = "message",
-      duration = 5
+  })
+
+  observeEvent(input$btn_db_connect, {
+    req(input$db_type)
+    type <- input$db_type
+
+    port_val <- NULL
+    if (nzchar(input$db_port %||% "")) {
+      port_val <- as.integer(input$db_port)
+    }
+
+    path_val <- ""
+    if (type == "sqlite" && !is.null(input$db_sqlite_file)) {
+      path_val <- input$db_sqlite_file$datapath
+    }
+
+    errors <- character(0)
+    notify_fn <- function(msg) { errors <<- c(errors, msg) }
+
+    conn <- withProgress(message = "Connecting...", value = 0.5, {
+      db_connect(
+        type = type,
+        host = input$db_host %||% "",
+        port = port_val,
+        dbname = input$db_name %||% "",
+        user = input$db_user %||% "",
+        password = input$db_pass %||% "",
+        schema = input$db_schema %||% "public",
+        driver = input$db_driver %||% "",
+        project = input$db_bq_project %||% "",
+        dataset = input$db_bq_dataset %||% "",
+        path = path_val,
+        notify_fn = notify_fn
+      )
+    })
+
+    for (e in errors) showNotification(e, type = "error", duration = 10)
+
+    if (!is.null(conn)) {
+      db_conn_rv(conn)
+      meta <- withProgress(message = "Introspecting schema...", value = 0.5, {
+        db_introspect(conn, type, input$db_schema %||% "public")
+      })
+      db_meta_rv(meta)
+
+      # Store declared FKs
+      if (length(meta$fks) > 0) {
+        schema_rels_rv(c(schema_rels_rv(), meta$fks))
+      }
+
+      showNotification(
+        paste0("Connected! Found ", length(meta$tables), " table(s)."),
+        type = "message", duration = 5
+      )
+    }
+  })
+
+  observeEvent(input$btn_db_disconnect, {
+    conn <- db_conn_rv()
+    if (!is.null(conn)) {
+      db_close(conn)
+      db_conn_rv(NULL)
+      db_meta_rv(NULL)
+      showNotification("Disconnected.", type = "message", duration = 3)
+    }
+  })
+
+  output$db_tables_ui <- renderUI({
+    meta <- db_meta_rv()
+    if (is.null(meta) || length(meta$tables) == 0) return(NULL)
+    checkboxGroupInput(
+      "db_selected_tables", "Select tables:",
+      choices = meta$tables,
+      selected = meta$tables[seq_len(min(10, length(meta$tables)))]
     )
   })
+
+  observeEvent(input$btn_db_load, {
+    conn <- db_conn_rv()
+    req(conn, input$db_selected_tables)
+
+    existing <- all_tables_rv()
+    existing_meta <- table_meta_rv()
+    schema_val <- input$db_schema %||% "public"
+    db_tname_renames <- list()
+
+    withProgress(message = "Loading tables...", value = 0, {
+      n <- length(input$db_selected_tables)
+      for (i in seq_along(input$db_selected_tables)) {
+        raw_tname <- input$db_selected_tables[i]
+        tname <- janitor::make_clean_names(raw_tname)
+        incProgress(1 / n, detail = tname)
+        df <- db_load_table(conn, raw_tname, schema_val)
+        if (!is.null(df) && nrow(df) > 0) {
+          clean_df <- janitor::clean_names(df)
+          existing[[tname]] <- clean_df
+          existing_meta[[tname]] <- list(
+            size = object.size(clean_df),
+            nrow = nrow(clean_df),
+            ncol = ncol(clean_df)
+          )
+          if (raw_tname != tname) {
+            db_tname_renames[[length(db_tname_renames) + 1]] <- data.frame(
+              object_type = "table", source = tname,
+              original_name = raw_tname, cleaned_name = tname,
+              stringsAsFactors = FALSE
+            )
+          }
+          # Column renames
+          col_orig <- names(df)
+          col_clean <- names(clean_df)
+          col_changed <- col_orig != col_clean
+          if (any(col_changed)) {
+            db_tname_renames[[length(db_tname_renames) + 1]] <- data.frame(
+              object_type = "column", source = tname,
+              original_name = col_orig[col_changed],
+              cleaned_name = col_clean[col_changed],
+              stringsAsFactors = FALSE
+            )
+          }
+        }
+      }
+    })
+
+    all_tables_rv(existing)
+    table_meta_rv(existing_meta)
+
+    if (length(db_tname_renames) > 0) {
+      prev <- rename_log_rv()
+      rename_log_rv(rbind(prev, do.call(rbind, db_tname_renames)))
+    }
+
+    showNotification(
+      paste0("Loaded ", length(input$db_selected_tables), " table(s) from database."),
+      type = "message", duration = 5
+    )
+  })
+
   observeEvent(input$remove_table_name, {
     nm <- input$remove_table_name
     tbl <- all_tables_rv()
@@ -1700,6 +1688,163 @@ server <- function(input, output, session) {
   fk_cache$key <- NULL
   fk_cache$result <- list()
 
+  # ---- Detection settings snapshot ----
+  # Stores a snapshot of detection settings; updated on button click or first load.
+  # auto_rels_rv reads from this instead of directly from inputs, so changing
+  # dropdowns/checkboxes does NOT immediately re-trigger detection.
+  detection_settings_rv <- reactiveVal(NULL)
+  detection_run_counter <- reactiveVal(0L)
+
+  # Snapshot current UI settings into detection_settings_rv
+  .snapshot_detection_settings <- function() {
+    detection_settings_rv(list(
+      method       = input$detect_method %||% "both",
+      min_conf     = input$min_confidence %||% "medium",
+      naming       = isTRUE(input$fl_naming),
+      value_overlap = isTRUE(input$fl_overlap),
+      cardinality  = isTRUE(input$fl_card),
+      format       = isTRUE(input$fl_fmt),
+      distribution = isTRUE(input$fl_dist),
+      null_pattern = isTRUE(input$fl_null)
+    ))
+    detection_run_counter(detection_run_counter() + 1L)
+  }
+
+  # "Run Detection" button click
+
+  observeEvent(input$btn_run_detection, {
+    .snapshot_detection_settings()
+    showNotification(
+      "\u25b6 Running detection with current settings...",
+      type = "message", duration = 3
+    )
+  })
+
+  # ---- Scan triage: estimate complexity and prompt user on large schemas ----
+  # States: "auto" (small schema, run immediately), "pending" (waiting for user),
+  #         "full", "naming_only", "skip" (user chose)
+  scan_strategy_rv <- reactiveVal("auto")
+  last_triage_key <- reactiveVal(NULL)
+  triage_btn_counter <- reactiveVal(0L)  # forces re-render after each triage choice
+
+  observeEvent(all_tables_rv(), {
+    tbls <- all_tables_rv()
+    if (length(tbls) < 2) {
+      scan_strategy_rv("auto")
+      .snapshot_detection_settings()
+      return()
+    }
+
+    # Only show triage once per table set
+    triage_key <- paste(sort(names(tbls)), collapse = ",")
+    if (identical(triage_key, last_triage_key())) return()
+    last_triage_key(triage_key)
+
+    # Invalidate cache so the new tables get a fresh scan
+    fk_cache$key <- NULL
+    fk_cache$result <- list()
+
+    est <- estimate_scan_complexity(tbls)
+
+    if (est$tier == "fast") {
+      scan_strategy_rv("auto")
+      .snapshot_detection_settings()
+      return()
+    }
+
+    # Block detection until user decides
+    scan_strategy_rv("pending")
+
+    # Build time estimate string
+    time_str <- if (est$est_time_sec < 60) {
+      paste0("~", ceiling(est$est_time_sec), " seconds")
+    } else {
+      paste0("~", round(est$est_time_sec / 60, 1), " minutes")
+    }
+
+    tier_color <- if (est$tier == "moderate") "#facc15" else "#f87171"
+
+    showModal(modalDialog(
+      title = tagList(
+        tags$span(
+          style = paste0("color:", tier_color, ";font-family:'IBM Plex Mono',monospace;"),
+          if (est$tier == "moderate") "\u26a0 Moderate schema size" else "\u26a0 Large schema detected"
+        )
+      ),
+      tags$div(
+        style = "font-family:'IBM Plex Mono',monospace;font-size:12px;line-height:1.8;",
+        tags$table(
+          style = "width:100%;border-collapse:collapse;margin-bottom:12px;",
+          tags$tr(
+            tags$td(style = "color:#64748b;padding:4px 10px;", "Tables"),
+            tags$td(style = "color:#e2e8f0;padding:4px 10px;font-weight:700;", est$n_tables)
+          ),
+          tags$tr(
+            tags$td(style = "color:#64748b;padding:4px 10px;", "Total columns"),
+            tags$td(style = "color:#e2e8f0;padding:4px 10px;font-weight:700;", est$total_cols)
+          ),
+          tags$tr(
+            tags$td(style = "color:#64748b;padding:4px 10px;", "Total rows"),
+            tags$td(style = "color:#e2e8f0;padding:4px 10px;font-weight:700;",
+                    format(est$total_rows, big.mark = ","))
+          ),
+          tags$tr(
+            tags$td(style = "color:#64748b;padding:4px 10px;", "Est. pair comparisons"),
+            tags$td(style = "color:#e2e8f0;padding:4px 10px;font-weight:700;",
+                    format(est$est_pairs, big.mark = ","))
+          ),
+          tags$tr(
+            tags$td(style = "color:#64748b;padding:4px 10px;", "Est. time (full scan)"),
+            tags$td(style = paste0("color:", tier_color, ";padding:4px 10px;font-weight:700;"),
+                    time_str)
+          )
+        ),
+        tags$p(style = "color:#94a3b8;font-size:11px;margin-top:8px;",
+               "How would you like to scan for relationships?")
+      ),
+      footer = tagList(
+        actionButton("triage_full", "\u25b6 Full scan (all signals)", class = "btn-add",
+                     style = "margin-right:6px;"),
+        actionButton("triage_naming", "\u26a1 Quick scan (naming only)", class = "btn-add",
+                     style = "margin-right:6px;background:#1a1a00;color:#facc15;border:1px solid #854d0e;"),
+        actionButton("triage_skip", "\u23ed Skip auto-detection", class = "btn-danger-soft",
+                     style = "width:auto;")
+      ),
+      easyClose = FALSE,
+      size = "s"
+    ))
+  })
+
+  observeEvent(input$triage_full, {
+    removeModal()
+    scan_strategy_rv("full")
+    .snapshot_detection_settings()
+    triage_btn_counter(triage_btn_counter() + 1L)
+    showNotification(
+      "\u25b6 Running full scan with all signals...",
+      type = "message", duration = 3
+    )
+  })
+  observeEvent(input$triage_naming, {
+    removeModal()
+    scan_strategy_rv("naming_only")
+    .snapshot_detection_settings()
+    triage_btn_counter(triage_btn_counter() + 1L)
+    showNotification(
+      "\u26a1 Running quick scan (naming conventions only)...",
+      type = "message", duration = 3
+    )
+  })
+  observeEvent(input$triage_skip, {
+    removeModal()
+    scan_strategy_rv("skip")
+    triage_btn_counter(triage_btn_counter() + 1L)
+    showNotification(
+      "\u23ed Auto-detection skipped. Add relationships manually.",
+      type = "warning", duration = 5
+    )
+  })
+
   # ---- PKs (fast — no caching needed) ----
   pk_map_rv <- reactive({
     tbls <- all_tables_rv()
@@ -1716,12 +1861,52 @@ server <- function(input, output, session) {
   })
 
   # ---- FK detection with cache ----
+  # Detection only runs when detection_settings_rv is snapshotted (via button
+  # click, initial table load, or triage choice). Changing UI dropdowns/toggles
+  # does NOT immediately re-trigger detection.
   auto_rels_rv <- reactive({
     tbls <- all_tables_rv()
-    method <- input$detect_method
+    strategy <- scan_strategy_rv()
+    settings <- detection_settings_rv()
+    detection_run_counter()  # explicit dependency: re-fire on snapshot
+    triage_btn_counter()     # dependency: re-fire when user picks a triage option
     req(length(tbls) > 0)
 
-    # Cache key: table names + dimensions + method — invalidates on any structural change
+    # Block until user decides on large schemas
+    if (identical(strategy, "pending")) return(list())
+
+    # If user chose to skip, return empty
+    if (identical(strategy, "skip")) return(list())
+
+    # No settings snapshot yet — nothing to run
+    if (is.null(settings)) return(list())
+
+    # Determine effective method based on strategy
+    method <- if (identical(strategy, "naming_only")) {
+      "naming"
+    } else {
+      settings$method
+    }
+    min_conf <- settings$min_conf %||% "medium"
+
+    # Build enable_flags from snapshotted settings (overridden by naming_only strategy)
+    if (identical(strategy, "naming_only")) {
+      flags <- list(
+        naming = TRUE, value_overlap = FALSE, cardinality = FALSE,
+        format = FALSE, distribution = FALSE, null_pattern = FALSE
+      )
+    } else {
+      flags <- list(
+        naming       = isTRUE(settings$naming),
+        value_overlap = isTRUE(settings$value_overlap),
+        cardinality  = isTRUE(settings$cardinality),
+        format       = isTRUE(settings$format),
+        distribution = isTRUE(settings$distribution),
+        null_pattern = isTRUE(settings$null_pattern)
+      )
+    }
+
+    # Cache key: table structure + method + confidence + flags + strategy
     key_parts <- paste(
       names(tbls),
       vapply(tbls, nrow, integer(1)),
@@ -1729,26 +1914,59 @@ server <- function(input, output, session) {
       sep = ":",
       collapse = "|"
     )
-    cache_key <- paste0(key_parts, "//", method)
+    flag_str <- paste(vapply(flags, as.character, character(1)), collapse = "")
+    cache_key <- paste0(key_parts, "//", method, "//", min_conf, "//", flag_str, "//", strategy)
 
     if (!is.null(fk_cache$key) && identical(fk_cache$key, cache_key)) {
       return(fk_cache$result)
     }
 
+    # Auto-sample large tables for FK detection performance
+    sampled_tbls <- lapply(tbls, function(df) {
+      if (nrow(df) > 10000) {
+        set.seed(42)
+        sampled <- df[sample(nrow(df), min(10000, nrow(df))), , drop = FALSE]
+        attr(sampled, "sampled") <- TRUE
+        sampled
+      } else {
+        df
+      }
+    })
+    names(sampled_tbls) <- names(tbls)
+
+    # Also cap the number of columns per table to avoid combinatorial blow-up
+    for (nm in names(sampled_tbls)) {
+      df <- sampled_tbls[[nm]]
+      if (ncol(df) > 60) {
+        # Keep id-like columns + first N columns
+        id_cols <- grep("(_id|_key|id$|key$|_code|_num)", names(df), value = TRUE)
+        other_cols <- setdiff(names(df), id_cols)
+        keep <- union(id_cols, head(other_cols, 60 - length(id_cols)))
+        sampled_tbls[[nm]] <- df[, keep, drop = FALSE]
+      }
+    }
+
     result <- withProgress(
       message = "Detecting relationships...",
-      value = 0.5,
-      tryCatch(
-        detect_fks(tbls, method),
-        error = function(e) {
-          showNotification(
-            paste0("Relationship detection error: ", conditionMessage(e)),
-            type = "error",
-            duration = 8
-          )
-          list()
-        }
-      )
+      value = 0.1,
+      {
+        incProgress(0.1, detail = paste0(length(sampled_tbls), " tables, sampling..."))
+        tryCatch(
+          {
+            r <- detect_fks(sampled_tbls, method, min_conf, flags)
+            incProgress(0.8, detail = paste0("Found ", length(r), " relationship(s)"))
+            r
+          },
+          error = function(e) {
+            showNotification(
+              paste0("Relationship detection error: ", conditionMessage(e)),
+              type = "error",
+              duration = 8
+            )
+            list()
+          }
+        )
+      }
     )
 
     fk_cache$key <- cache_key
@@ -1758,8 +1976,31 @@ server <- function(input, output, session) {
 
   # ---- Manual rels ----
   manual_rels_rv <- reactiveVal(list())
+
+  # ---- Relationship management state ----
+  false_positives_rv <- reactiveVal(character(0))
+  conf_overrides_rv <- reactiveVal(list())
+
+  rel_key <- function(r) paste(r$from_table, r$from_col, r$to_table, r$to_col, sep = "|")
+
   all_rels_rv <- reactive({
-    c(auto_rels_rv(), manual_rels_rv())
+    raw <- c(auto_rels_rv(), manual_rels_rv(), schema_rels_rv())
+    suppressed <- false_positives_rv()
+    overrides <- conf_overrides_rv()
+
+    # Filter out suppressed relationships
+    filtered <- Filter(function(r) !rel_key(r) %in% suppressed, raw)
+
+    # Apply confidence overrides
+    lapply(filtered, function(r) {
+      k <- rel_key(r)
+      if (k %in% names(overrides)) {
+        r$confidence <- overrides[[k]]
+        conf_rank <- c(low = 0.3, medium = 0.7, high = 0.95)
+        r$score <- conf_rank[[r$confidence]]
+      }
+      r
+    })
   })
 
   # ---- has_tables ----
@@ -1844,21 +2085,13 @@ server <- function(input, output, session) {
     tryCatch(
       {
         net <- build_network(tbls, all_rels_rv(), pk_map_rv())
-        visNetwork(net$nodes, net$edges, background = "#0f172a") %>%
+        layout_mode <- input$erd_layout %||% "force"
+        spring_len <- input$spring_length %||% 220
+
+        vis <- visNetwork(net$nodes, net$edges, background = "#0f172a") %>%
           visOptions(
             highlightNearest = list(enabled = TRUE, degree = 1, hover = TRUE),
             nodesIdSelection = FALSE
-          ) %>%
-          visLayout(randomSeed = 42) %>%
-          visPhysics(
-            solver = "forceAtlas2Based",
-            forceAtlas2Based = list(
-              gravitationalConstant = -80,
-              springLength = 220,
-              springConstant = 0.04,
-              damping = 0.9
-            ),
-            stabilization = list(iterations = 300, fit = TRUE)
           ) %>%
           visEdges(smooth = list(enabled = TRUE, type = "dynamic")) %>%
           visNodes(widthConstraint = list(minimum = 130, maximum = 230)) %>%
@@ -1878,6 +2111,54 @@ server <- function(input, output, session) {
           }
         }"
           )
+
+        if (layout_mode == "hierarchical") {
+          vis <- vis %>%
+            visHierarchicalLayout(direction = "UD", sortMethod = "directed") %>%
+            visPhysics(enabled = FALSE)
+        } else if (layout_mode == "circular") {
+          n_nodes <- nrow(net$nodes)
+          if (n_nodes > 0) {
+            radius <- max(200, n_nodes * 50)
+            angles <- seq(0, 2 * pi, length.out = n_nodes + 1)[seq_len(n_nodes)]
+            net$nodes$x <- cos(angles) * radius
+            net$nodes$y <- sin(angles) * radius
+          }
+          vis <- visNetwork(net$nodes, net$edges, background = "#0f172a") %>%
+            visOptions(
+              highlightNearest = list(enabled = TRUE, degree = 1, hover = TRUE),
+              nodesIdSelection = FALSE
+            ) %>%
+            visEdges(smooth = list(enabled = TRUE, type = "dynamic")) %>%
+            visNodes(widthConstraint = list(minimum = 130, maximum = 230)) %>%
+            visInteraction(navigationButtons = TRUE, tooltipDelay = 80, hover = TRUE) %>%
+            visPhysics(enabled = FALSE) %>%
+            visEvents(
+              click = "function(params) {
+            if (params.nodes.length > 0) {
+              Shiny.setInputValue('vis_clicked_node', {
+                id: params.nodes[0],
+                ts: Date.now()
+              }, {priority: 'event'});
+              showNodePanel(params.nodes[0]);
+            }
+          }"
+            )
+        } else {
+          vis <- vis %>%
+            visLayout(randomSeed = 42) %>%
+            visPhysics(
+              solver = "forceAtlas2Based",
+              forceAtlas2Based = list(
+                gravitationalConstant = -80,
+                springLength = spring_len,
+                springConstant = 0.04,
+                damping = 0.9
+              ),
+              stabilization = list(iterations = 300, fit = TRUE)
+            )
+        }
+        vis
       },
       error = function(e) {
         showNotification(
@@ -2048,8 +2329,11 @@ server <- function(input, output, session) {
     pk_v <- pks[[t]]
     fk_rels <- Filter(function(r) r$from_table == t, rels)
     fk_cols <- vapply(fk_rels, `[[`, character(1), "from_col")
+    nc <- ncol(df)
     data.frame(
       table = t,
+      table_rows = rep(nrow(df), nc),
+      table_cols = rep(nc, nc),
       column = names(df),
       type = vapply(
         df,
@@ -2136,13 +2420,16 @@ server <- function(input, output, session) {
     }
 
     methods <- list(
-      list(key = "naming", label = "Naming Convention", cls = "m-naming"),
-      list(
-        key = "uniqueness",
-        label = "Uniqueness / Value Subset",
-        cls = "m-uniqueness"
-      ),
-      list(key = "manual", label = "Manual", cls = "m-manual")
+      list(key = "naming",          label = "Naming Convention",    cls = "m-naming"),
+      list(key = "name_similarity", label = "Name Similarity",      cls = "m-name_similarity"),
+      list(key = "value_overlap",   label = "Value Overlap",        cls = "m-value_overlap"),
+      list(key = "cardinality",     label = "Cardinality Match",    cls = "m-cardinality"),
+      list(key = "format",          label = "Format Fingerprint",   cls = "m-format"),
+      list(key = "distribution",    label = "Distribution Similarity", cls = "m-distribution"),
+      list(key = "null_pattern",    label = "Null Pattern",         cls = "m-null_pattern"),
+      list(key = "content",         label = "Content Analysis",     cls = "m-content"),
+      list(key = "schema",          label = "Schema Defined",       cls = "m-schema"),
+      list(key = "manual",          label = "Manual",               cls = "m-manual")
     )
 
     tagList(
@@ -2162,19 +2449,89 @@ server <- function(input, output, session) {
             } else {
               "?"
             }
+
+            # Confidence indicator
+            conf <- if (!is.null(r$confidence)) r$confidence else ""
+            score_val <- if (!is.null(r$score)) r$score else NA
+            conf_tags <- if (nzchar(conf)) {
+              tagList(
+                span(class = paste("conf-dot", paste0("conf-", conf))),
+                span(class = "conf-label", paste0(
+                  conf,
+                  if (!is.na(score_val)) paste0(" ", round(score_val * 100), "%") else ""
+                ))
+              )
+            } else {
+              NULL
+            }
+
+            # Signal chips
+            signal_tags <- NULL
+            if (!is.null(r$signals) && length(r$signals) > 0) {
+              signal_tags <- div(
+                class = "signal-chips",
+                lapply(names(r$signals), function(s) {
+                  span(class = "signal-chip", s)
+                })
+              )
+            }
+
+            rk <- paste(r$from_table, r$from_col, r$to_table, to_col, sep = "|")
+            suppress_id <- paste0("suppress_", gsub("[^a-zA-Z0-9]", "_", rk))
+
             div(
               class = "rel-row",
               span(class = "rel-table", r$from_table),
               span(class = "rel-col", paste0(".", r$from_col)),
-              span(class = "rel-arrow", "→"),
+              span(class = "rel-arrow", "\u2192"),
               span(class = "rel-table", r$to_table),
               span(class = "rel-col", paste0(".", to_col)),
-              span(class = paste("rel-method", m$cls), m$key)
+              span(class = paste("rel-method", m$cls), m$key),
+              conf_tags,
+              signal_tags,
+              tags$button(
+                class = "btn btn-xs",
+                style = "font-size:9px;padding:1px 5px;margin-left:6px;background:#1a0a0a;color:#f87171;border:1px solid #7f1d1d;border-radius:4px;cursor:pointer;",
+                onclick = sprintf(
+                  "Shiny.setInputValue('suppress_rel', '%s', {priority: 'event'})",
+                  rk
+                ),
+                "\u2715"
+              )
             )
           })
         )
-      })
+      }),
+      # Global relationship management controls
+      if (length(false_positives_rv()) > 0) {
+        div(
+          style = "margin-top:12px;padding-top:8px;border-top:1px solid var(--border);",
+          span(style = "font-size:10px;color:var(--text-faint);",
+               paste0(length(false_positives_rv()), " relationship(s) suppressed")),
+          tags$button(
+            class = "btn btn-xs",
+            style = "font-size:10px;padding:2px 8px;margin-left:8px;background:#0c2a1a;color:#4ade80;border:1px solid #15803d;border-radius:4px;cursor:pointer;",
+            onclick = "Shiny.setInputValue('restore_suppressed', Date.now(), {priority: 'event'})",
+            "Restore all"
+          )
+        )
+      }
     )
+  })
+
+  # ---- Relationship suppress/restore ----
+  observeEvent(input$suppress_rel, {
+    rk <- input$suppress_rel
+    current <- false_positives_rv()
+    if (!rk %in% current) {
+      false_positives_rv(c(current, rk))
+      showNotification("Relationship suppressed.", type = "message", duration = 3)
+    }
+  })
+
+  observeEvent(input$restore_suppressed, {
+    false_positives_rv(character(0))
+    showNotification("All suppressed relationships restored.", type = "message", duration = 3)
   })
 
   # ---- Sticky node detail panel ----
@@ -2284,11 +2641,11 @@ server <- function(input, output, session) {
       return(tagList(
         div(
           class = "rename-summary",
-          "No name changes detected. All column names were already clean."
+          "No name changes detected. All table and column names were already clean."
         ),
         div(
           class = "empty-state",
-          div(style = "font-size:36px;margin-bottom:12px;", "✓"),
+          div(style = "font-size:36px;margin-bottom:12px;", "\u2713"),
           h4("All names clean"),
           p(
             style = "font-size:13px;color:var(--text-faint);",
@@ -2299,13 +2656,17 @@ server <- function(input, output, session) {
     }
 
     n_tables <- length(unique(log$source))
+    n_tbl_renames <- sum(log$object_type == "table")
+    n_col_renames <- sum(log$object_type == "column")
     tagList(
       div(
         class = "rename-summary",
         tags$b(nrow(log)),
-        " column name(s) renamed across ",
+        " name(s) renamed across ",
         tags$b(n_tables),
-        " table(s). ",
+        " table(s)",
+        if (n_tbl_renames > 0) paste0(" (", n_tbl_renames, " table, ", n_col_renames, " column)"),
+        ". ",
         "Amber = PK-related, purple = FK-related columns."
       ),
       DTOutput("dt_rename_log"),
@@ -2342,11 +2703,9 @@ server <- function(input, output, session) {
       if (length(rels) == 0) {
         write.csv(
           data.frame(
-            from_table = "",
-            from_col = "",
-            to_table = "",
-            to_col = "",
-            detected_by = ""
+            from_table = "", from_col = "", to_table = "", to_col = "",
+            detected_by = "", confidence = "", score = numeric(0),
+            signals = "", reasons = ""
           )[0, ],
           file,
           row.names = FALSE
@@ -2359,12 +2718,12 @@ server <- function(input, output, session) {
               from_table = r$from_table,
               from_col = r$from_col,
               to_table = r$to_table,
-              to_col = if (!is.na(r$to_col) && !is.null(r$to_col)) {
-                r$to_col
-              } else {
-                ""
-              },
+              to_col = if (!is.na(r$to_col) && !is.null(r$to_col)) r$to_col else "",
               detected_by = r$detected_by,
+              confidence = if (!is.null(r$confidence)) r$confidence else "",
+              score = if (!is.null(r$score)) r$score else NA_real_,
+              signals = if (!is.null(r$signals)) paste(names(r$signals), collapse = "; ") else "",
+              reasons = if (!is.null(r$reasons)) paste(r$reasons, collapse = "; ") else "",
               stringsAsFactors = FALSE
             )
           })
@@ -2373,6 +2732,115 @@ server <- function(input, output, session) {
       }
     }
   )
+  # ---- Export: Relationships CSV (from Export tab) ----
+  output$dl_rels_csv <- downloadHandler(
+    filename = "table_relationships.csv",
+    content = function(file) {
+      rels <- all_rels_rv()
+      if (length(rels) == 0) {
+        write.csv(
+          data.frame(
+            from_table = "", from_col = "", to_table = "", to_col = "",
+            detected_by = "", confidence = "", score = numeric(0),
+            signals = "", reasons = ""
+          )[0, ],
+          file, row.names = FALSE
+        )
+      } else {
+        df <- do.call(rbind, lapply(rels, function(r) {
+          data.frame(
+            from_table = r$from_table, from_col = r$from_col,
+            to_table = r$to_table,
+            to_col = if (!is.na(r$to_col) && !is.null(r$to_col)) r$to_col else "",
+            detected_by = r$detected_by,
+            confidence = if (!is.null(r$confidence)) r$confidence else "",
+            score = if (!is.null(r$score)) r$score else NA_real_,
+            signals = if (!is.null(r$signals)) paste(names(r$signals), collapse = "; ") else "",
+            reasons = if (!is.null(r$reasons)) paste(r$reasons, collapse = "; ") else "",
+            stringsAsFactors = FALSE
+          )
+        }))
+        write.csv(df, file, row.names = FALSE)
+      }
+    }
+  )
+
+  # ---- Export: dbt schema.yml ----
+  output$dl_dbt_yaml <- downloadHandler(
+    filename = "schema.yml",
+    content = function(file) {
+      yaml_str <- generate_dbt_yaml(all_tables_rv(), all_rels_rv(), pk_map_rv())
+      writeLines(yaml_str, file)
+    }
+  )
+
+  # ---- Export: Mermaid ERD ----
+  output$dl_mermaid <- downloadHandler(
+    filename = "erd.mmd",
+    content = function(file) {
+      mmd_str <- generate_mermaid_erd(all_tables_rv(), all_rels_rv(), pk_map_rv())
+      writeLines(mmd_str, file)
+    }
+  )
+
+  # ---- Export: Session save ----
+  output$dl_session <- downloadHandler(
+    filename = function() {
+      paste0("table_explorer_session_", format(Sys.Date(), "%Y%m%d"), ".json")
+    },
+    content = function(file) {
+      json_str <- save_session_json(
+        tables = all_tables_rv(),
+        rels = all_rels_rv(),
+        manual_rels = manual_rels_rv(),
+        schema_rels = schema_rels_rv(),
+        settings = list(
+          detect_method = input$detect_method,
+          min_confidence = input$min_confidence
+        )
+      )
+      writeLines(json_str, file)
+    }
+  )
+
+  # ---- Session restore ----
+  observeEvent(input$restore_session_file, {
+    req(input$restore_session_file)
+    json_text <- readLines(input$restore_session_file$datapath, warn = FALSE)
+    json_text <- paste(json_text, collapse = "\n")
+
+    result <- tryCatch(
+      restore_session_json(json_text),
+      error = function(e) {
+        showNotification(
+          paste0("Could not restore session: ", conditionMessage(e)),
+          type = "error", duration = 8
+        )
+        NULL
+      }
+    )
+    if (is.null(result)) return()
+
+    if (length(result$tables) > 0) {
+      all_tables_rv(result$tables)
+      # Rebuild metadata
+      meta <- lapply(result$tables, function(df) {
+        list(size = object.size(df), nrow = nrow(df), ncol = ncol(df))
+      })
+      table_meta_rv(meta)
+    }
+    if (length(result$manual_relationships) > 0) {
+      manual_rels_rv(result$manual_relationships)
+    }
+    if (length(result$schema_relationships) > 0) {
+      schema_rels_rv(result$schema_relationships)
+    }
+
+    showNotification(
+      paste0("Session restored: ", length(result$tables), " table(s)"),
+      type = "message", duration = 5
+    )
+  })
 }
 
 shinyApp(ui, server)
