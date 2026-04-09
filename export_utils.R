@@ -5,7 +5,7 @@
 
 # ── dbt schema.yml generator ──────────────────────────────────
 
-generate_dbt_yaml <- function(tables, rels, pks) {
+generate_dbt_yaml <- function(tables, rels, pks, composite_pks = NULL) {
   lines <- c("version: 2", "", "models:")
 
   for (tname in names(tables)) {
@@ -14,6 +14,8 @@ generate_dbt_yaml <- function(tables, rels, pks) {
     lines <- c(lines, "    columns:")
 
     pk_cols <- pks[[tname]]
+    cpk_groups <- if (!is.null(composite_pks)) composite_pks[[tname]] else list()
+    cpk_cols <- unique(unlist(cpk_groups))
     t_rels <- Filter(function(r) r$from_table == tname, rels)
     fk_map <- setNames(
       lapply(t_rels, function(r) r),
@@ -26,6 +28,8 @@ generate_dbt_yaml <- function(tables, rels, pks) {
       tests <- character(0)
       if (col %in% pk_cols) {
         tests <- c(tests, "          - unique", "          - not_null")
+      } else if (col %in% cpk_cols) {
+        tests <- c(tests, "          - not_null")
       }
       if (col %in% names(fk_map)) {
         r <- fk_map[[col]]
@@ -40,6 +44,22 @@ generate_dbt_yaml <- function(tables, rels, pks) {
         lines <- c(lines, "        tests:", tests)
       }
     }
+
+    # Emit a dbt_utils unique_combination_of_columns test for composite keys
+    if (length(cpk_groups) > 0) {
+      lines <- c(lines, "    tests:")
+      for (g in cpk_groups) {
+        col_list <- paste0(
+          vapply(g, function(col) paste0("          - ", col), character(1)),
+          collapse = "\n"
+        )
+        lines <- c(lines, paste0(
+          "      - dbt_utils.unique_combination_of_columns:\n",
+          "          combination_of_columns:\n",
+          col_list
+        ))
+      }
+    }
   }
 
   paste(lines, collapse = "\n")
@@ -47,13 +67,14 @@ generate_dbt_yaml <- function(tables, rels, pks) {
 
 # ── Mermaid ERD generator ─────────────────────────────────────
 
-generate_mermaid_erd <- function(tables, rels, pks) {
+generate_mermaid_erd <- function(tables, rels, pks, composite_pks = NULL) {
   lines <- c("erDiagram")
 
   # Table definitions
   for (tname in names(tables)) {
     df <- tables[[tname]]
     pk_cols <- pks[[tname]]
+    cpk_cols <- unique(unlist(if (!is.null(composite_pks)) composite_pks[[tname]] else list()))
     lines <- c(lines, paste0("    ", tname, " {"))
     for (col in names(df)) {
       dtype <- if (is.numeric(df[[col]])) {
@@ -63,7 +84,7 @@ generate_mermaid_erd <- function(tables, rels, pks) {
       } else {
         "string"
       }
-      pk_marker <- if (col %in% pk_cols) " PK" else ""
+      pk_marker <- if (col %in% pk_cols) " PK" else if (col %in% cpk_cols) " PK" else ""
       lines <- c(lines, paste0("        ", dtype, " ", col, pk_marker))
     }
     lines <- c(lines, "    }")
