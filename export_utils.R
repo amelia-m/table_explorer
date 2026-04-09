@@ -49,15 +49,13 @@ generate_dbt_yaml <- function(tables, rels, pks, composite_pks = NULL) {
     if (length(cpk_groups) > 0) {
       lines <- c(lines, "    tests:")
       for (g in cpk_groups) {
-        col_list <- paste0(
-          vapply(g, function(col) paste0("          - ", col), character(1)),
-          collapse = "\n"
+        col_entries <- vapply(g, function(col) paste0("          - ", col), character(1L))
+        lines <- c(
+          lines,
+          "      - dbt_utils.unique_combination_of_columns:",
+          "          combination_of_columns:",
+          col_entries
         )
-        lines <- c(lines, paste0(
-          "      - dbt_utils.unique_combination_of_columns:\n",
-          "          combination_of_columns:\n",
-          col_list
-        ))
       }
     }
   }

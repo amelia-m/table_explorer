@@ -598,7 +598,7 @@ def detect_composite_pks(
     # Try 3-column combinations
     if max_combo_size >= 3 and len(candidates) >= 3:
         for i, c1 in enumerate(candidates[:-2]):
-            for j, c2 in enumerate(candidates[i + 1:-1], start=i + 1):
+            for j, c2 in enumerate(candidates[i + 1:], start=i + 1):
                 for c3 in candidates[j + 1:]:
                     if df[c1].isna().any() or df[c2].isna().any() or df[c3].isna().any():
                         continue
