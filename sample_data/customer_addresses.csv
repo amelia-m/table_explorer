@@ -1,0 +1,8 @@
+customer_id,address_type,street,city,country
+1,billing,123 Maple St,New York,US
+1,shipping,456 Oak Ave,Brooklyn,US
+2,billing,10 King Rd,London,UK
+3,billing,88 Orchard Rd,Singapore,SG
+4,billing,Rua das Flores 22,Sao Paulo,BR
+5,billing,14 Green Lane,Dublin,IE
+5,shipping,20 River View,Cork,IE

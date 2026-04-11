@@ -115,6 +115,88 @@
                     "type": "numeric"
                 }
             ]
+        },
+        {
+            "name": "suppliers",
+            "columns": [
+                {
+                    "name": "supplier_id",
+                    "type": "integer",
+                    "primary_key": true
+                },
+                {
+                    "name": "name",
+                    "type": "text"
+                },
+                {
+                    "name": "country",
+                    "type": "text"
+                },
+                {
+                    "name": "contact_email",
+                    "type": "text"
+                }
+            ]
+        },
+        {
+            "name": "product_suppliers",
+            "primary_key": ["product_id", "supplier_id"],
+            "columns": [
+                {
+                    "name": "product_id",
+                    "type": "integer",
+                    "foreign_key": {
+                        "table": "products",
+                        "column": "product_id"
+                    }
+                },
+                {
+                    "name": "supplier_id",
+                    "type": "integer",
+                    "foreign_key": {
+                        "table": "suppliers",
+                        "column": "supplier_id"
+                    }
+                },
+                {
+                    "name": "unit_cost",
+                    "type": "numeric"
+                },
+                {
+                    "name": "lead_days",
+                    "type": "integer"
+                }
+            ]
+        },
+        {
+            "name": "customer_addresses",
+            "primary_key": ["customer_id", "address_type"],
+            "columns": [
+                {
+                    "name": "customer_id",
+                    "type": "integer",
+                    "foreign_key": {
+                        "table": "customers",
+                        "column": "customer_id"
+                    }
+                },
+                {
+                    "name": "address_type",
+                    "type": "text"
+                },
+                {
+                    "name": "street",
+                    "type": "text"
+                },
+                {
+                    "name": "city",
+                    "type": "text"
+                },
+                {
+                    "name": "country",
+                    "type": "text"
+                }
+            ]
         }
     ]
 }
