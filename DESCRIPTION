@@ -1,9 +1,15 @@
-Type: Shiny
 Package: tableexplorer
+Type: Package
 Title: Table Relationship Explorer
 Version: 0.2.0
+Authors@R:
+    person("Table Explorer", role = c("aut", "cre"),
+           email = "author@example.com")
 Description: Interactive Shiny app for exploring table relationships with
-    multi-signal FK detection, ERD visualization, and multi-format file support.
+    multi-signal FK detection, ERD visualization, and multi-format file
+    support.
+License: MIT + file LICENSE
+Encoding: UTF-8
 Depends:
     R (>= 4.1.0)
 Imports:
@@ -11,7 +17,8 @@ Imports:
     visNetwork,
     DT,
     shinythemes,
-    janitor
+    janitor,
+    golem
 Suggests:
     testthat (>= 3.0.0),
     jsonlite,
