@@ -3,10 +3,6 @@
 # ============================================================
 #
 # @noRd
-# ============================================================
-# inference.R — PK/FK Detection Engine (7-Signal)
-# Table Relationship Explorer
-# ============================================================
 
 # janitor functions available via package imports
 

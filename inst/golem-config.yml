@@ -1,7 +1,7 @@
 default:
   app_prod: false
   golem_name: tableexplorer
-  golem_version: 0.2.0
+  app_version: 0.2.0
   app_url: ~
   shiny.maxRequestSize: 104857600
 

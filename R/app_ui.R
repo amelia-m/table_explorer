@@ -27,7 +27,7 @@ app_ui <- function(request) {
       tags$button(
         id = "theme-toggle",
         div(class = "toggle-track", div(class = "toggle-thumb")),
-        tags$span(id = "toggle-label", "\u263d Dark")
+        tags$span(id = "toggle-label", "Light mode")
       )
     ),
 
