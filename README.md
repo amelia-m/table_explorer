@@ -27,25 +27,58 @@ The primary implementation is **R/Shiny**. A **Python/Streamlit** version also e
 | **Exports** | Relationships CSV, dbt schema.yml, Mermaid ERD, session save/restore (JSON) |
 | **Duplicate handling** | Detects re-uploads by file size/dimensions; offers overwrite, keep both, or skip |
 
-### Architecture
+### Architecture (golem package)
+
+The app is structured as an R package using the [golem](https://thinkr-open.github.io/golem/) framework.
 
 ```
-app.R                  Main Shiny application (UI + server)
-inference.R            7-signal PK/FK detection engine
-file_readers.R         Multi-format file parser (18 formats)
-db_connectors.R        Database connection, introspection, loading
-export_utils.R         dbt YAML, Mermaid ERD, session JSON
-tests/testthat/        Unit tests (~100 cases across 4 suites)
-sample_data/           Sample CSV files (customers, products, orders, order_items)
-schema.json            Sample 5-table e-commerce schema
+R/
+  run_app.R              Entry point — tableexplorer::run_app()
+  app_ui.R               Top-level UI (assembles modules)
+  app_server.R           Top-level server (wires module reactive values)
+  mod_upload.R           Upload panel + manual override
+  mod_db_connect.R       Database connection panel
+  mod_detection.R        Detection controls + scan triage
+  mod_erd.R              ERD visualization (visNetwork)
+  mod_table_details.R    Per-table column summary
+  mod_relationships.R    Relationships tab
+  mod_name_changes.R     Name changes / rename log tab
+  mod_export.R           Export panel (CSV, dbt YAML, Mermaid, session)
+  utils_inference.R      7-signal PK/FK detection engine
+  utils_file_readers.R   Multi-format file parser (18 formats)
+  utils_db_connectors.R  Database connection, introspection, loading
+  utils_export.R         dbt YAML, Mermaid ERD, session JSON
+  utils_vis.R            ERD network builder (build_network)
+  utils_helpers.R        Shared helpers (%||%)
+inst/
+  app/www/               Static assets (styles.css, app.js)
+  extdata/               Sample data + schema.json
+  golem-config.yml       App configuration
+dev/
+  01_start.R             One-time project setup
+  02_dev.R               Development helpers
+  03_deploy.R            Deployment helpers
+tests/testthat/          Unit tests (~100 cases across 4 suites)
+```
+
+**Reactive data flow between modules:**
+
+```
+app_server.R
+├─ all_tables_rv   ← mod_upload, mod_db_connect (mutate)
+├─ schema_rels_rv  ← mod_upload, mod_db_connect (mutate)
+├─ manual_rels_rv  ← mod_upload (returns)
+├─ detection opts  ← mod_detection (returns)
+├─ pk_map_rv, composite_pk_map_rv, auto_rels_rv  (computed)
+├─ all_rels_rv     → mod_erd, mod_table_details, mod_relationships, mod_export
+└─ false_positives_rv ← mod_relationships (mutated via observeEvents)
 ```
 
 ### Installation
 
-**Required packages:**
-
 ```r
-install.packages(c("shiny", "visNetwork", "DT", "shinythemes", "janitor"))
+# Install from GitHub
+remotes::install_github("amelia-m/table_explorer")
 ```
 
 **Optional packages** (installed on demand for specific formats/databases):
@@ -67,7 +100,13 @@ install.packages("RJDBC")
 ### Run locally
 
 ```r
-shiny::runApp("app.R")
+# After install:
+library(tableexplorer)
+run_app()
+
+# Or during development (no install needed):
+pkgload::load_all()
+run_app()
 ```
 
 ### The 7 inference signals
@@ -107,6 +146,8 @@ A sample schema (`schema.json`) is included in the repository.
 
 ### Deploy to Posit Connect
 
+See `dev/03_deploy.R` for deployment helpers.
+
 **From VS Code / Positron:** Install the Posit Publisher extension, open the project folder, and deploy as a Shiny Application.
 
 **From GitHub:** Push to a public repo, then in Posit Connect go to New Content > Import from Git.
@@ -116,10 +157,12 @@ A sample schema (`schema.json`) is included in the repository.
 ### Running tests
 
 ```r
-testthat::test_dir("tests/testthat")
-```
+# Recommended: uses devtools and loads the package properly
+devtools::test()
 
-Tests cover the detection engine, file readers, export utilities, and database connectors. Database tests that require optional packages (e.g. RSQLite) are automatically skipped when the package is not installed.
+# Or directly with testthat:
+testthat::test_package("tableexplorer")
+```
 
 ---
 
