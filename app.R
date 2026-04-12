@@ -23,7 +23,7 @@ source("db_connectors.R")
 # Visualization
 # ============================================================
 
-build_network <- function(tables, rels, pk_map) {
+build_network <- function(tables, rels, pk_map, composite_pk_map = NULL) {
   tnames <- names(tables)
   name_to_id <- setNames(seq_along(tnames), tnames)
 
@@ -49,6 +49,8 @@ build_network <- function(tables, rels, pk_map) {
       function(t) {
         df <- tables[[t]]
         pks <- pk_map[[t]]
+        cpk_groups <- if (!is.null(composite_pk_map)) composite_pk_map[[t]] else list()
+        cpk_cols <- unique(unlist(cpk_groups))
         fkr <- Filter(function(r) r$from_table == t, rels)
         fk_s <- if (length(fkr) > 0) {
           paste(
@@ -64,6 +66,11 @@ build_network <- function(tables, rels, pk_map) {
         }
         pk_s <- if (length(pks) > 0) {
           paste(pks, collapse = ", ")
+        } else if (length(cpk_groups) > 0) {
+          paste(
+            vapply(cpk_groups, function(g) paste0("(", paste(g, collapse = " + "), ")"), character(1)),
+            collapse = " | "
+          )
         } else {
           "none detected"
         }
@@ -117,7 +124,7 @@ build_network <- function(tables, rels, pk_map) {
               vapply(
                 show_cols,
                 function(cn) {
-                  chip_bg <- if (cn %in% pks) {
+                  chip_bg <- if (cn %in% pks || cn %in% cpk_cols) {
                     "background:#2a1a00;color:#fbbf24;border-color:#78350f;"
                   } else if (
                     cn %in% vapply(fkr, `[[`, character(1), "from_col")
@@ -781,6 +788,16 @@ ui <- fluidPage(
             class = "btn-primary",
             style = "width:100%; margin-top:6px; margin-bottom:2px;"
           )
+        ),
+        checkboxInput(
+          "enable_composite_pk",
+          "Detect composite keys",
+          value = FALSE
+        ),
+        div(
+          style = "font-size: 11px; color: var(--text-faint); margin-top: -6px; line-height: 1.5;",
+          "When no single-column PK is found, try combinations of 2\u20133 columns",
+          "whose values together uniquely identify each row."
         ),
 
         tags$hr(),
@@ -1860,6 +1877,19 @@ server <- function(input, output, session) {
     )
   })
 
+  # ---- Composite PKs (optional, off by default) ----
+  composite_pk_map_rv <- reactive({
+    if (!isTRUE(input$enable_composite_pk)) {
+      return(setNames(vector("list", length(all_tables_rv())), names(all_tables_rv())))
+    }
+    tbls <- all_tables_rv()
+    req(length(tbls) > 0)
+    setNames(
+      lapply(names(tbls), function(t) detect_composite_pks(tbls[[t]], t)),
+      names(tbls)
+    )
+  })
+
   # ---- FK detection with cache ----
   # Detection only runs when detection_settings_rv is snapshotted (via button
   # click, initial table load, or triage choice). Changing UI dropdowns/toggles
@@ -2084,7 +2114,7 @@ server <- function(input, output, session) {
     req(length(tbls) > 0)
     tryCatch(
       {
-        net <- build_network(tbls, all_rels_rv(), pk_map_rv())
+        net <- build_network(tbls, all_rels_rv(), pk_map_rv(), composite_pk_map_rv())
         layout_mode <- input$erd_layout %||% "force"
         spring_len <- input$spring_length %||% 220
 
@@ -2185,6 +2215,7 @@ server <- function(input, output, session) {
     tbls <- all_tables_rv()
     req(length(tbls) > 0)
     pks <- pk_map_rv()
+    cpks <- composite_pk_map_rv()
     rels <- all_rels_rv()
 
     tagList(
@@ -2200,6 +2231,7 @@ server <- function(input, output, session) {
       lapply(names(tbls), function(t) {
         df <- tbls[[t]]
         pk_v <- pks[[t]]
+        cpk_groups <- cpks[[t]]  # list of character vectors
         fk_rels <- Filter(function(r) r$from_table == t, rels)
         fk_cols <- vapply(fk_rels, `[[`, character(1), "from_col")
         dl_id <- paste0("dl_tbl_", make.names(t))
@@ -2213,6 +2245,10 @@ server <- function(input, output, session) {
           if (length(pk_v) > 0) {
             lapply(pk_v, function(p) {
               span(class = "pill pill-pk", paste0("PK: ", p))
+            })
+          } else if (length(cpk_groups) > 0) {
+            lapply(cpk_groups, function(g) {
+              span(class = "pill pill-pk", paste0("CPK: ", paste(g, collapse = " + ")))
             })
           } else {
             span(class = "pill pill-warn", "\u26a0 no PK")
@@ -2260,6 +2296,7 @@ server <- function(input, output, session) {
     tbls <- all_tables_rv()
     req(length(tbls) > 0)
     pks <- pk_map_rv()
+    cpks <- composite_pk_map_rv()
     rels <- all_rels_rv()
 
     lapply(names(tbls), function(t) {
@@ -2270,8 +2307,16 @@ server <- function(input, output, session) {
           {
             df <- tbls[[tname]]
             pk_v <- pks[[tname]]
+            cpk_groups <- cpks[[tname]]
+            cpk_cols <- unique(unlist(cpk_groups))
             fk_rels <- Filter(function(r) r$from_table == tname, rels)
             fk_cols <- vapply(fk_rels, `[[`, character(1), "from_col")
+
+            pk_marker <- vapply(names(df), function(col) {
+              if (col %in% pk_v) "✓"
+              else if (col %in% cpk_cols) "CPK"
+              else ""
+            }, character(1L))
 
             smry <- data.frame(
               Column = names(df),
@@ -2286,7 +2331,7 @@ server <- function(input, output, session) {
                 function(x) length(unique(na.omit(x))),
                 integer(1)
               ),
-              `PK` = ifelse(names(df) %in% pk_v, "✓", ""),
+              `PK` = pk_marker,
               `FK` = ifelse(names(df) %in% fk_cols, "✓", ""),
               check.names = FALSE,
               stringsAsFactors = FALSE
@@ -2308,8 +2353,8 @@ server <- function(input, output, session) {
             ) %>%
               formatStyle(
                 "PK",
-                color = styleEqual("✓", "#fbbf24"),
-                backgroundColor = styleEqual("✓", "#1a1000")
+                color = styleEqual(c("✓", "CPK"), c("#fbbf24", "#fbbf24")),
+                backgroundColor = styleEqual(c("✓", "CPK"), c("#1a1000", "#1a1000"))
               ) %>%
               formatStyle(
                 "FK",
@@ -2545,6 +2590,7 @@ server <- function(input, output, session) {
     req(node_id)
     tbls <- all_tables_rv()
     pks <- pk_map_rv()
+    cpks <- composite_pk_map_rv()
     rels <- all_rels_rv()
 
     # node_id is the integer index; map back to table name
@@ -2553,12 +2599,14 @@ server <- function(input, output, session) {
     t <- tnames[[node_id]]
     df <- tbls[[t]]
     pk_v <- pks[[t]]
+    cpk_groups <- cpks[[t]]
+    cpk_cols <- unique(unlist(cpk_groups))
     fk_r <- Filter(function(r) r$from_table == t, rels)
     fk_cols <- vapply(fk_r, `[[`, character(1), "from_col")
 
-    # Column chips: PK = amber, FK = purple, plain = muted
+    # Column chips: PK/CPK = amber, FK = purple, plain = muted
     col_chips <- lapply(names(df), function(cn) {
-      if (cn %in% pk_v) {
+      if (cn %in% pk_v || cn %in% cpk_cols) {
         tags$span(
           class = "col-chip",
           style = "background:#2a1a00;color:#fbbf24;border-color:#78350f;",
@@ -2600,6 +2648,11 @@ server <- function(input, output, session) {
         if (length(pk_v) > 0) {
           tags$div(lapply(pk_v, function(p) {
             tags$span(class = "pill pill-pk", p)
+          }))
+        } else if (length(cpk_groups) > 0) {
+          tags$div(lapply(cpk_groups, function(g) {
+            tags$span(class = "pill pill-pk",
+                      paste0("CPK: ", paste(g, collapse = " + ")))
           }))
         } else {
           tags$span(style = "color:#f87171;font-size:12px;", "none detected")
@@ -2769,7 +2822,7 @@ server <- function(input, output, session) {
   output$dl_dbt_yaml <- downloadHandler(
     filename = "schema.yml",
     content = function(file) {
-      yaml_str <- generate_dbt_yaml(all_tables_rv(), all_rels_rv(), pk_map_rv())
+      yaml_str <- generate_dbt_yaml(all_tables_rv(), all_rels_rv(), pk_map_rv(), composite_pk_map_rv())
       writeLines(yaml_str, file)
     }
   )
@@ -2778,7 +2831,7 @@ server <- function(input, output, session) {
   output$dl_mermaid <- downloadHandler(
     filename = "erd.mmd",
     content = function(file) {
-      mmd_str <- generate_mermaid_erd(all_tables_rv(), all_rels_rv(), pk_map_rv())
+      mmd_str <- generate_mermaid_erd(all_tables_rv(), all_rels_rv(), pk_map_rv(), composite_pk_map_rv())
       writeLines(mmd_str, file)
     }
   )

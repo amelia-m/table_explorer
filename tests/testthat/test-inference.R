@@ -418,3 +418,68 @@ test_that("format_patterns list has expected entries", {
   expect_true("iso_date" %in% pattern_names)
   expect_true("int_code" %in% pattern_names)
 })
+
+# ── Composite primary key detection ──────────────────────────
+
+test_that("detect_composite_pks returns empty when single-column PK exists", {
+  df <- data.frame(id = 1:5, order_id = c(1, 1, 2, 2, 3), product_id = 1:5)
+  result <- detect_composite_pks(df, "items")
+  expect_length(result, 0)
+})
+
+test_that("detect_composite_pks detects 2-column composite key", {
+  df <- data.frame(
+    order_id   = c(1, 1, 2, 2, 3),
+    product_id = c(10, 20, 10, 30, 20),
+    quantity   = c(1, 2, 3, 4, 5)
+  )
+  result <- detect_composite_pks(df, "order_items")
+  expect_length(result, 1)
+  expect_setequal(result[[1]], c("order_id", "product_id"))
+})
+
+test_that("detect_composite_pks detects 3-column composite key", {
+  df <- data.frame(
+    a = c(1, 1, 1, 2),
+    b = c(1, 1, 2, 1),
+    c = c(1, 2, 1, 1),
+    d = c("x", "y", "z", "w")
+  )
+  result <- detect_composite_pks(df, "t")
+  expect_length(result, 1)
+  expect_setequal(result[[1]], c("a", "b", "c"))
+})
+
+test_that("detect_composite_pks returns empty for truly non-unique data", {
+  df <- data.frame(
+    a = c(1, 1, 1),
+    b = c(1, 1, 1)
+  )
+  result <- detect_composite_pks(df, "t")
+  expect_length(result, 0)
+})
+
+test_that("detect_composite_pks returns empty for df with fewer than 2 rows", {
+  df <- data.frame(order_id = 1L, product_id = 2L)
+  result <- detect_composite_pks(df, "items")
+  expect_length(result, 0)
+})
+
+test_that("detect_composite_pks skips columns with NAs in the combo", {
+  df <- data.frame(
+    order_id   = c(1, 1, 2, NA, 3),
+    product_id = c(10, 20, 10, 30, 20),
+    quantity   = c(1, 2, 3, 4, 5)
+  )
+  # order_id has NA so the pair (order_id, product_id) cannot be a CPK
+  result <- detect_composite_pks(df, "order_items")
+  if (length(result) > 0) {
+    expect_false("order_id" %in% result[[1]])
+  }
+})
+
+test_that("detect_composite_pks returns empty for single-column table", {
+  df <- data.frame(val = c(1, 1, 2))
+  result <- detect_composite_pks(df, "t")
+  expect_length(result, 0)
+})

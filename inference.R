@@ -387,6 +387,80 @@ is_fk_candidate <- function(col, col_name) {
   TRUE
 }
 
+# ── Composite primary key detection ──────────────────────────
+# Returns a list of character vectors, each representing one composite key
+# group whose combined values are unique across all rows.
+# Only runs when no single-column PK is found via detect_pks().
+
+detect_composite_pks <- function(df, table_name,
+                                 max_combo_size  = 3L,
+                                 max_candidates  = 20L) {
+  n <- nrow(df)
+  if (n < 2L) return(list())
+
+  # Skip if a single-column PK already exists
+  if (length(detect_pks(df, table_name, method = "both")) > 0L) return(list())
+
+  cols <- names(df)
+
+  # Collect candidate columns: skip logicals, all-NA, and long free-text
+  candidates <- cols[vapply(cols, function(col) {
+    v <- df[[col]]
+    if (is.logical(v)) return(FALSE)
+    v_clean <- na.omit(v)
+    if (length(v_clean) == 0L) return(FALSE)
+    if (is.character(v) &&
+        median(nchar(head(as.character(v_clean), 50L))) > 80) {
+      return(FALSE)
+    }
+    TRUE
+  }, logical(1L))]
+
+  if (length(candidates) < 2L) return(list())
+
+  # Sort: id-like columns first for faster discovery
+  id_like <- grepl(
+    "(_id|_key|id$|key$|_code|_num|_no)$",
+    vapply(candidates, clean_name, character(1L))
+  )
+  candidates <- c(candidates[id_like], candidates[!id_like])
+  candidates <- head(candidates, max_candidates)
+  n_cand <- length(candidates)
+
+  # Try 2-column combinations
+  for (i in seq_len(n_cand - 1L)) {
+    for (j in seq.int(i + 1L, n_cand)) {
+      c1 <- candidates[[i]]
+      c2 <- candidates[[j]]
+      if (anyNA(df[[c1]]) || anyNA(df[[c2]])) next
+      if (length(unique(paste(df[[c1]], df[[c2]], sep = "\x01"))) == n) {
+        return(list(c(c1, c2)))
+      }
+    }
+  }
+
+  # Try 3-column combinations
+  if (max_combo_size >= 3L && n_cand >= 3L) {
+    for (i in seq_len(n_cand - 2L)) {
+      for (j in seq.int(i + 1L, n_cand - 1L)) {
+        for (k in seq.int(j + 1L, n_cand)) {
+          c1 <- candidates[[i]]
+          c2 <- candidates[[j]]
+          c3 <- candidates[[k]]
+          if (anyNA(df[[c1]]) || anyNA(df[[c2]]) || anyNA(df[[c3]])) next
+          if (length(unique(
+            paste(df[[c1]], df[[c2]], df[[c3]], sep = "\x01")
+          )) == n) {
+            return(list(c(c1, c2, c3)))
+          }
+        }
+      }
+    }
+  }
+
+  list()
+}
+
 # ── Foreign key detection (multi-signal) ─────────────────────
 
 detect_fks <- function(tables, method = "both", min_confidence = "medium",

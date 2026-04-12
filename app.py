@@ -536,6 +536,83 @@ def detect_pks(df: pd.DataFrame, table_name: str, method: str = "both") -> list[
     return []
 
 
+def detect_composite_pks(
+    df: pd.DataFrame,
+    table_name: str,
+    max_combo_size: int = 3,
+    max_candidates: int = 20,
+) -> list[list[str]]:
+    """
+    Detect composite (multi-column) primary keys.
+
+    A composite key is a minimal set of columns whose combined values
+    uniquely identify every row, where no single column alone is unique.
+
+    Returns a list of column-name lists, one per detected composite key.
+    Returns an empty list if a single-column PK already exists or none found.
+    """
+    n = len(df)
+    if n < 2:
+        return []
+
+    # Skip if a single-column PK already exists
+    if detect_pks(df, table_name, method="both"):
+        return []
+
+    cols = df.columns.tolist()
+
+    # Collect candidate columns: skip booleans, all-NA, and long free-text
+    def _is_candidate(col: str) -> bool:
+        s = df[col]
+        if s.dtype == bool:
+            return False
+        clean = s.dropna()
+        if len(clean) == 0:
+            return False
+        if s.dtype == object:
+            sample = clean.head(50).astype(str)
+            if sample.str.len().median() > 80:
+                return False
+        return True
+
+    candidates = [c for c in cols if _is_candidate(c)]
+
+    if len(candidates) < 2:
+        return []
+
+    # Sort: id-like columns first for faster discovery
+    id_re = re.compile(r"(_id|_key|id$|key$|_code|_num|_no)$")
+    id_like = [c for c in candidates if id_re.search(clean_name(c))]
+    non_id  = [c for c in candidates if c not in id_like]
+    candidates = (id_like + non_id)[:max_candidates]
+
+    # Try 2-column combinations
+    for i, c1 in enumerate(candidates[:-1]):
+        for c2 in candidates[i + 1:]:
+            if df[c1].isna().any() or df[c2].isna().any():
+                continue
+            combined = df[c1].astype(str) + "\x01" + df[c2].astype(str)
+            if combined.nunique() == n:
+                return [[c1, c2]]
+
+    # Try 3-column combinations
+    if max_combo_size >= 3 and len(candidates) >= 3:
+        for i, c1 in enumerate(candidates[:-2]):
+            for j, c2 in enumerate(candidates[i + 1:], start=i + 1):
+                for c3 in candidates[j + 1:]:
+                    if df[c1].isna().any() or df[c2].isna().any() or df[c3].isna().any():
+                        continue
+                    combined = (
+                        df[c1].astype(str) + "\x01"
+                        + df[c2].astype(str) + "\x01"
+                        + df[c3].astype(str)
+                    )
+                    if combined.nunique() == n:
+                        return [[c1, c2, c3]]
+
+    return []
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Content-based inference helpers
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1007,7 +1084,9 @@ def table_digest(tables: dict, method: str) -> str:
 # Network / Graph builder (pyvis via networkx)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def build_pyvis_html(tables: dict, rels: list[dict], pk_map: dict, spring_length: int = 220, dark_mode: bool = True) -> str:
+def build_pyvis_html(tables: dict, rels: list[dict], pk_map: dict,
+                     cpk_map: dict | None = None,
+                     spring_length: int = 220, dark_mode: bool = True) -> str:
     """
     Render an interactive vis.js network and return the HTML string.
     Tooltips are injected via a custom overlay div driven by JS to avoid
@@ -1051,9 +1130,15 @@ def build_pyvis_html(tables: dict, rels: list[dict], pk_map: dict, spring_length
 
     for tname, df in tables.items():
         pks = pk_map.get(tname, [])
+        cpks = (cpk_map or {}).get(tname, [])
         fk_rels = [r for r in rels if r["from_table"] == tname]
         fk_str = "<br>".join(f"{r['from_col']} → {r['to_table']}" for r in fk_rels) or "none"
-        pk_str = ", ".join(pks) if pks else "none detected"
+        if pks:
+            pk_str = ", ".join(pks)
+        elif cpks:
+            pk_str = " | ".join(" + ".join(g) for g in cpks) + " (composite)"
+        else:
+            pk_str = "none detected"
         src = df.attrs.get("source", "csv")
         row_str = f"{len(df):,}" if len(df) > 0 else "schema"
 
@@ -1511,6 +1596,16 @@ with st.sidebar:
             "format":        False, "distribution": False, "null_pattern": False,
         }
 
+    enable_composite_pk = st.checkbox(
+        "Detect composite keys",
+        value=False,
+        key="enable_composite_pk",
+        help=(
+            "When no single-column primary key is found, try combinations "
+            "of 2–3 columns whose values together uniquely identify each row."
+        ),
+    )
+
     # ── 04 Manual Override ───────────────────────────────────────────────
     st.markdown('<div class="sidebar-section">04 // Manual Override</div>', unsafe_allow_html=True)
     tnames = list(st.session_state.tables.keys())
@@ -1561,6 +1656,11 @@ else:
     pk_method = "both" if method == "manual" else method
     pk_map = {t: detect_pks(df, t, pk_method) for t, df in tables.items()}
 
+    # Compute composite PKs (optional, off by default)
+    cpk_map: dict[str, list[list[str]]] = {}
+    if enable_composite_pk:
+        cpk_map = {t: detect_composite_pks(df, t) for t, df in tables.items()}
+
     # Compute FK rels (cached by digest that includes all detection params)
     flags_key = json.dumps(enable_flags, sort_keys=True)
     digest = table_digest(tables, f"{method}/{min_confidence}/{flags_key}/{st.session_state.get('dark_mode', True)}")
@@ -1605,19 +1705,31 @@ else:
             )
 
         try:
-            html = build_pyvis_html(tables, all_rels, pk_map, spring_length=spring_length, dark_mode=st.session_state.get('dark_mode', True))
+            html = build_pyvis_html(tables, all_rels, pk_map, cpk_map=cpk_map, spring_length=spring_length, dark_mode=st.session_state.get('dark_mode', True))
             st.components.v1.html(html, height=580, scrolling=False)
             st.markdown('<div class="erd-hint">drag to move &amp; pin nodes · double-click to unpin · scroll to zoom · hover for details</div>', unsafe_allow_html=True)
         except Exception as e:
             st.error(f"ERD render error: {e}")
 
     # ─── Table Details ────────────────────────────────────────────────────
+
+    def _pk_label(col: str, single_pks: list[str], composite_cols: set[str]) -> str:
+        if col in single_pks:
+            return "✓"
+        if col in composite_cols:
+            return "CPK"
+        return ""
+
     with tab_details:
         for tname, df in tables.items():
             pks = pk_map.get(tname, [])
+            cpks = cpk_map.get(tname, [])   # list of column-name lists
             fk_rels = [r for r in all_rels if r["from_table"] == tname]
             fk_cols = [r["from_col"] for r in fk_rels]
             src = df.attrs.get("source", "csv")
+
+            # Flat set of all columns that are part of any composite key
+            cpk_cols: set[str] = {c for group in cpks for c in group}
 
             # Pills HTML
             pills = f'<span class="pill p-rows">{len(df):,} rows</span>' if len(df) > 0 else f'<span class="pill p-schema">schema only</span>'
@@ -1626,6 +1738,10 @@ else:
             if pks:
                 for p in pks:
                     pills += f'<span class="pill p-pk">PK: {p}</span>'
+            elif cpks:
+                for group in cpks:
+                    label = " + ".join(group)
+                    pills += f'<span class="pill p-pk">CPK: {label}</span>'
             else:
                 pills += '<span class="pill p-warn">⚠ no PK</span>'
             for r in fk_rels:
@@ -1643,7 +1759,7 @@ else:
                     "Type": [str(df[c].dtype) for c in df.columns],
                     "Non-null": [df[c].notna().sum() for c in df.columns],
                     "Unique": [df[c].nunique() for c in df.columns],
-                    "PK": ["✓" if c in pks else "" for c in df.columns],
+                    "PK": [_pk_label(c, pks, cpk_cols) for c in df.columns],
                     "FK": ["✓" if c in fk_cols else "" for c in df.columns],
                 })
             else:
@@ -1664,7 +1780,7 @@ else:
                         "Type": ["—"] * len(df.columns),
                         "Non-null": ["—"] * len(df.columns),
                         "Unique": ["—"] * len(df.columns),
-                        "PK": ["✓" if c in pks else "" for c in df.columns],
+                        "PK": [_pk_label(c, pks, cpk_cols) for c in df.columns],
                         "FK": ["✓" if c in fk_cols else "" for c in df.columns],
                     })
 
